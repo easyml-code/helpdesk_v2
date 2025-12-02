@@ -1,12 +1,11 @@
 import streamlit as st
 import requests
 from datetime import datetime
-from typing import List, Dict
-import time
+import atexit
 
 
 # Configuration
-API_BASE_URL = "http://localhost:8000/api"  # Adjust as needed
+API_BASE_URL = "http://localhost:8000/api"
 
 
 def init_session_state():
@@ -23,6 +22,22 @@ def init_session_state():
         st.session_state.messages = []
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+
+
+def save_current_chat():
+    """Save current chat before switching or closing"""
+    if st.session_state.current_chat_id:
+        try:
+            requests.post(
+                f"{API_BASE_URL}/chat/{st.session_state.current_chat_id}/end",
+                params={
+                    "access_token": st.session_state.access_token,
+                    "refresh_token": st.session_state.refresh_token
+                }
+            )
+            st.success("💾 Chat saved successfully!")
+        except Exception as e:
+            st.error(f"Error saving chat: {str(e)}")
 
 
 def login(email: str, password: str):
@@ -71,12 +86,15 @@ def load_chat_history():
 def load_chat_messages(chat_id: str):
     """Load messages for a specific chat"""
     try:
+        # Save current chat first
+        if st.session_state.current_chat_id and st.session_state.current_chat_id != chat_id:
+            save_current_chat()
+        
         response = requests.get(
             f"{API_BASE_URL}/chat/{chat_id}/messages",
             params={
                 "access_token": st.session_state.access_token,
-                "refresh_token": st.session_state.refresh_token,
-                "limit": 100
+                "refresh_token": st.session_state.refresh_token
             }
         )
         
@@ -87,6 +105,7 @@ def load_chat_messages(chat_id: str):
                 for msg in data["messages"]
             ]
             st.session_state.current_chat_id = chat_id
+            st.success(f"✅ Loaded chat: {chat_id[:16]}...")
         else:
             st.error("Failed to load messages")
     except Exception as e:
@@ -113,7 +132,7 @@ def send_message(message: str, topic: str = None):
             data = response.json()
             st.session_state.current_chat_id = data["chat_id"]
             
-            # Add messages to session
+            # Update messages in session
             st.session_state.messages.append({"role": "user", "content": message})
             st.session_state.messages.append({"role": "assistant", "content": data["response"]})
             
@@ -126,19 +145,16 @@ def send_message(message: str, topic: str = None):
         return False
 
 
-def end_session():
-    """End current chat session"""
+def start_new_chat():
+    """Start a new chat (saves old one first)"""
+    # Save current chat
     if st.session_state.current_chat_id:
-        try:
-            requests.post(
-                f"{API_BASE_URL}/chat/{st.session_state.current_chat_id}/end",
-                params={
-                    "access_token": st.session_state.access_token,
-                    "refresh_token": st.session_state.refresh_token
-                }
-            )
-        except Exception as e:
-            st.error(f"Error ending session: {str(e)}")
+        save_current_chat()
+    
+    # Clear state for new chat
+    st.session_state.current_chat_id = None
+    st.session_state.messages = []
+    st.success("✨ New chat started!")
 
 
 def main():
@@ -149,6 +165,10 @@ def main():
     )
     
     init_session_state()
+    
+    # Save chat on app close (best effort)
+    if st.session_state.authenticated and st.session_state.current_chat_id:
+        atexit.register(save_current_chat)
     
     # Login screen
     if not st.session_state.authenticated:
@@ -171,18 +191,25 @@ def main():
     
     # Sidebar - Chat History
     with st.sidebar:
-        st.header("Chat History")
+        st.header("💬 Chat History")
         
-        if st.button("🔄 Refresh History"):
-            load_chat_history()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Refresh", use_container_width=True):
+                load_chat_history()
+                st.rerun()
         
-        if st.button("➕ New Chat"):
-            st.session_state.current_chat_id = None
-            st.session_state.messages = []
-            st.rerun()
+        with col2:
+            if st.button("➕ New Chat", use_container_width=True):
+                start_new_chat()
+                load_chat_history()
+                st.rerun()
         
-        if st.button("🚪 Logout"):
-            end_session()
+        if st.button("💾 Save Chat", use_container_width=True):
+            save_current_chat()
+        
+        if st.button("🚪 Logout", use_container_width=True):
+            save_current_chat()
             st.session_state.clear()
             st.rerun()
         
@@ -191,7 +218,7 @@ def main():
         # Display chat history
         for chat in st.session_state.chat_history:
             chat_id = chat.get("chat_id")
-            topic = chat.get("topic", "Untitled")
+            topic = chat.get("topic", "Untitled Chat")
             message_count = chat.get("message_count", 0)
             updated_at = chat.get("updated_at", "")
             
@@ -202,28 +229,35 @@ def main():
             except:
                 date_str = "Unknown"
             
+            # Highlight current chat
+            is_current = chat_id == st.session_state.current_chat_id
+            button_type = "primary" if is_current else "secondary"
+            
             # Chat button
             if st.button(
-                f"💬 {topic[:20]}{'...' if len(topic) > 20 else ''}\n📅 {date_str} | 💬 {message_count}",
+                f"{'📌' if is_current else '💬'} {topic[:25]}{'...' if len(topic) > 25 else ''}\n"
+                f"🕒 {date_str} | 💬 {message_count} msgs",
                 key=chat_id,
-                use_container_width=True
+                use_container_width=True,
+                type=button_type
             ):
-                load_chat_messages(chat_id)
-                st.rerun()
+                if not is_current:
+                    load_chat_messages(chat_id)
+                    st.rerun()
     
     # Main chat area
     st.header("Chat")
     
     # Display current chat info
     if st.session_state.current_chat_id:
-        st.caption(f"Chat ID: {st.session_state.current_chat_id}")
+        st.caption(f"💬 Chat ID: {st.session_state.current_chat_id[:20]}... | 📝 {len(st.session_state.messages)} messages")
     else:
-        st.caption("New Chat - Start a conversation!")
+        st.info("✨ Start a new conversation by typing below!")
     
     # Display messages
     chat_container = st.container()
     with chat_container:
-        for message in st.session_state.messages:
+        for i, message in enumerate(st.session_state.messages):
             role = message["role"]
             content = message["content"]
             
@@ -238,27 +272,15 @@ def main():
     user_input = st.chat_input("Type your message here...")
     
     if user_input:
-        # Show user message immediately
-        with chat_container:
-            with st.chat_message("user", avatar="👤"):
-                st.write(user_input)
-        
-        # Get topic if new chat
+        # Get topic if new chat (use first message as topic)
         topic = None
         if not st.session_state.current_chat_id:
-            # Simple topic extraction (first 50 chars of message)
-            topic = user_input[:50]
+            topic = user_input[:50]  # First 50 chars as topic
         
-        # Send message and get response
-        with st.spinner("Thinking..."):
+        # Send message
+        with st.spinner("🤔 Thinking..."):
             if send_message(user_input, topic):
-                # Show assistant response
-                with chat_container:
-                    with st.chat_message("assistant", avatar="🤖"):
-                        st.write(st.session_state.messages[-1]["content"])
-                
-                # Reload chat history to update sidebar
-                load_chat_history()
+                load_chat_history()  # Refresh sidebar
                 st.rerun()
 
 

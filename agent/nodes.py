@@ -3,24 +3,23 @@ from agent.state import AgentState
 from langchain_core.runnables import RunnableConfig
 from agent.llm import get_llm
 from agent.chat_manager import chat_manager
+from agent.prompts import SYSTEM_PROMPT_HELPDESK, DATABASE_SCHEMA
+from database.client import run_query
 from logs.log import logger
-from typing import Dict, Any
-import time
+from langgraph.prebuilt import ToolNode
+from agent.tools import TOOLS
+from logs.log import logger
 
+tool_node = ToolNode(TOOLS)
 
 async def process_input(state: AgentState, config: RunnableConfig) -> AgentState:
-    """Process user input and check limits"""
-    
-    access_token = config.get("configurable", {}).get("access_token")
-    refresh_token = config.get("configurable", {}).get("refresh_token")
+    """Process user input and validate chat"""
     
     chat_id = state.get("chat_id")
     
-    # Check token limit
+    # Check token limit (from cache)
     if chat_id:
-        within_limit = await chat_manager.check_token_limit(
-            chat_id, access_token, refresh_token
-        )
+        within_limit = await chat_manager.check_token_limit(chat_id)
         
         if not within_limit:
             state["messages"].append(
@@ -28,71 +27,70 @@ async def process_input(state: AgentState, config: RunnableConfig) -> AgentState
             )
             return state
     
-    logger.info(f"Processing input for chat {chat_id}")
+    logger.info(f"Input validated for chat {chat_id}")
     return state
 
 async def generate_response(state: AgentState, config: RunnableConfig) -> AgentState:
-    """Generate AI response using LLM"""
+    """Generate AI response using LLM with tool support"""
     
     llm = get_llm()
     messages = state["messages"]
+    chat_id = state["chat_id"]
     
-    # Add system message if first message in this interaction
+    # Bind tools to LLM
+    llm_with_tools = llm.bind_tools(TOOLS)
+    
+    # Build message list
     full_messages = list(messages)
-    if len(full_messages) == 1:
+    
+    # Add system message on first interaction
+    if len([m for m in messages if isinstance(m, (HumanMessage, AIMessage))]) == 1:
         system_msg = SystemMessage(
-            content="You are a helpful AI assistant. Provide clear, accurate, and helpful responses."
+            content= SYSTEM_PROMPT_HELPDESK + "\n\n" + DATABASE_SCHEMA
         )
         full_messages = [system_msg] + full_messages
     
     try:
-        # Invoke LLM
-        response = await llm.ainvoke(full_messages)
-        
-        # Add AI response to messages
-        ai_message = AIMessage(content=response.content)
-        state["messages"].append(ai_message)
-        
-        # Get the actual user message content
+        # Get user message
         user_msg_content = ""
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage):
                 user_msg_content = msg.content
                 break
         
-        ai_msg_content = response.content
+        # Invoke LLM with tools
+        logger.info(f"🤖 Generating response for chat {chat_id}")
+        response = await llm_with_tools.ainvoke(full_messages, config=config)
         
-        # Estimate tokens (rough approximation: 1 token ≈ 0.75 words)
-        estimated_user_tokens = int(len(user_msg_content.split()) * 1.33)
-        estimated_ai_tokens = int(len(ai_msg_content.split()) * 1.33)
-        total_estimated = estimated_user_tokens + estimated_ai_tokens
+        # Track tokens
+        metadata = response.response_metadata.get("token_usage", {})
+        input_tokens = metadata.get("prompt_tokens", 0) or metadata.get("input_tokens", 0)
+        output_tokens = metadata.get("completion_tokens", 0) or metadata.get("output_tokens", 0)
+        total_tokens = input_tokens + output_tokens
         
-        state["total_tokens"] = state.get("total_tokens", 0) + total_estimated
+        print(f"\nInput: {input_tokens} | Output: {output_tokens} | Total: {total_tokens}\n")
         
-        # Add to pending messages
-        chat_manager.add_pending_message(
-            chat_id=state["chat_id"],
-            session_id=state["session_id"],
-            role="user",
-            content=user_msg_content,
-            tokens=estimated_user_tokens
-        )
+        # Add AI response to messages
+        state["messages"].append(response)
+        state["total_tokens"] = state.get("total_tokens", 0) + total_tokens
         
-        chat_manager.add_pending_message(
-            chat_id=state["chat_id"],
-            session_id=state["session_id"],
-            role="assistant",
-            content=ai_msg_content,
-            tokens=estimated_ai_tokens
-        )
+        # Cache user message if exists
+        if user_msg_content:
+            chat_manager.add_message_to_cache(
+                chat_id=chat_id,
+                role="user",
+                content=user_msg_content,
+                tokens=input_tokens
+            )
         
-        logger.info(f"Generated response for chat {state['chat_id']}, tokens: {total_estimated}")
+        logger.info(f"✅ Response generated ({total_tokens} tokens)")
         
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
+        logger.error(f"❌ Error: {e}", exc_info=True)
         state["messages"].append(
             AIMessage(content="I apologize, but I encountered an error. Please try again.")
         )
+    
     return state
 
 async def generate_response1(state: AgentState, config: RunnableConfig) -> AgentState:
@@ -100,50 +98,71 @@ async def generate_response1(state: AgentState, config: RunnableConfig) -> Agent
     
     llm = get_llm()
     messages = state["messages"]
+    chat_id = state["chat_id"]
     
-    # Add system message if first message
+    # Build message list for LLM
+    full_messages = list(messages)
+    
+    # Add system message if first interaction
     if len([m for m in messages if isinstance(m, (HumanMessage, AIMessage))]) == 1:
         system_msg = SystemMessage(
             content="You are a helpful AI assistant. Provide clear, accurate, and helpful responses."
         )
-        messages = [system_msg] + list(messages)
+        full_messages = [system_msg] + full_messages
     
     try:
-        # Invoke LLM
-        response = await llm.ainvoke(messages)
+        # Get user message (last HumanMessage)
+        user_msg_content = ""
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                user_msg_content = msg.content
+                break
         
-        # Add AI response to messages
+        # Invoke LLM
+        logger.info(f"🤖 Generating response for chat {chat_id}")
+        response = await llm.ainvoke(full_messages)
+        metadata = response.response_metadata["token_usage"]
+
+        input_tokens = metadata.get("prompt_tokens") or metadata.get("input_tokens")
+        output_tokens = metadata.get("completion_tokens") or metadata.get("output_tokens")
+        total_tokens = metadata["total_tokens"]
+        print("\n\n")
+        print("Input tokens:", input_tokens)
+        print("Output tokens:", output_tokens)
+        print("Total tokens:", total_tokens)
+        print("\n\n")
+        
+        # Add AI response to state
         ai_message = AIMessage(content=response.content)
         state["messages"].append(ai_message)
         
-        # Estimate tokens (rough approximation)
-        user_msg = messages[-1].content if messages else ""
-        ai_msg = response.content
+        ai_msg_content = response.content
         
-        estimated_tokens = len(user_msg.split()) + len(ai_msg.split())
-        state["total_tokens"] = state.get("total_tokens", 0) + estimated_tokens
+        estimated_user_tokens = int(input_tokens)
+        estimated_ai_tokens = int(output_tokens)
+        total_estimated = estimated_user_tokens + estimated_ai_tokens
         
-        # Add to pending messages
-        chat_manager.add_pending_message(
-            chat_id=state["chat_id"],
-            session_id=state["session_id"],
+        state["total_tokens"] = state.get("total_tokens", 0) + total_estimated
+        
+        # Add messages to CACHE ONLY (not DB yet)
+        chat_manager.add_message_to_cache(
+            chat_id=chat_id,
             role="user",
-            content=user_msg,
-            tokens=len(user_msg.split())
+            content=user_msg_content,
+            tokens=estimated_user_tokens
         )
         
-        chat_manager.add_pending_message(
-            chat_id=state["chat_id"],
-            session_id=state["session_id"],
+        chat_manager.add_message_to_cache(
+            chat_id=chat_id,
             role="assistant",
-            content=ai_msg,
-            tokens=len(ai_msg.split())
+            content=ai_msg_content,
+            tokens=estimated_ai_tokens
         )
         
-        logger.info(f"Generated response for chat {state['chat_id']}, tokens: {estimated_tokens}")
+        logger.info(f"✅ Response generated and cached for {chat_id} ({total_estimated} tokens)")
         
     except Exception as e:
-        logger.error(f"Error generating response: {e}")
+        logger.error(f"❌ Error generating response: {e}", exc_info=True)
         state["messages"].append(
             AIMessage(content="I apologize, but I encountered an error. Please try again.")
         )
@@ -152,21 +171,19 @@ async def generate_response1(state: AgentState, config: RunnableConfig) -> Agent
 
 
 async def save_messages(state: AgentState, config: RunnableConfig) -> AgentState:
-    """Auto-save messages if interval has passed"""
+    """
+    This node is now a NO-OP during normal flow.
+    Messages are saved only when:
+    1. User explicitly ends session
+    2. User switches to another chat
+    3. Session timeout occurs
+    """
     
-    access_token = config.get("configurable", {}).get("access_token")
-    refresh_token = config.get("configurable", {}).get("refresh_token")
     chat_id = state.get("chat_id")
+    logger.info(f"ℹ️ Messages remain cached for {chat_id} (will save on session end)")
     
-    if chat_id:
-        try:
-            saved = await chat_manager.save_pending_messages(
-                chat_id, access_token, refresh_token, force=False
-            )
-            if saved > 0:
-                logger.info(f"Auto-saved {saved} messages for chat {chat_id}")
-        except Exception as e:
-            logger.error(f"Error auto-saving messages: {e}")
+    # Optional: You can add auto-save logic here if needed
+    # For example, save every N messages or every X minutes
     
     return state
 
@@ -182,3 +199,12 @@ def should_continue(state: AgentState) -> str:
             return "end"
     
     return "continue"
+
+def route_after_llm(state: AgentState) -> str:
+    """Route to tools if LLM made tool calls, otherwise continue"""
+    last_message = state["messages"][-1]
+
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        logger.info(f"🔧 Routing to tool: {last_message.tool_calls[0]['name']}")
+        return "tools"
+    return "save"

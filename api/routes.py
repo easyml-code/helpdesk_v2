@@ -17,7 +17,7 @@ router = APIRouter()
 
 class ChatRequest(BaseModel):
     message: str
-    chat_id: Optional[str] = None
+    chat_id: Optional[str] = None  # If None -> create new, if provided -> use existing
     topic: Optional[str] = None
 
 
@@ -84,23 +84,56 @@ async def chat(
         # Get user ID from token
         user_id = await get_user_from_token(access_token)
         
-        # Get or create chat
-        chat_info = await chat_manager.get_or_create_chat(
-            user_id=user_id,
-            access_token=access_token,
-            refresh_token=refresh_token,
-            topic=request.topic
-        )
+        # Determine if new chat or existing
+        if request.chat_id:
+            # Load existing chat (will use cache if available)
+            chat_info = await chat_manager.get_or_load_chat(
+                chat_id=request.chat_id,
+                user_id=user_id,
+                access_token=access_token,
+                refresh_token=refresh_token
+            )
+            logger.info(f"📂 Using existing chat: {request.chat_id}")
+        else:
+            # Create new chat in DB FIRST
+            chat_info = await chat_manager.create_new_chat(
+                user_id=user_id,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                topic=request.topic
+            )
+            logger.info(f"✨ Created new chat: {chat_info['chat_id']}")
         
         chat_id = chat_info['chat_id']
+        session_id = chat_info['session_id']
         is_new_chat = chat_info['is_new']
         
-        # Generate session ID
-        session_id = chat_manager.generate_session_id()
+        # Check token limit
+        if not await chat_manager.check_token_limit(chat_id):
+            return ChatResponse(
+                response="This chat has reached its maximum length. Please start a new chat to continue.",
+                chat_id=chat_id,
+                session_id=session_id,
+                is_new_chat=False
+            )
         
-        # Prepare initial state
+        # Prepare initial state with cached messages
+        cached_messages = chat_manager.get_cached_messages(chat_id)
+        
+        # Convert cached messages to LangChain format
+        from langchain_core.messages import HumanMessage, AIMessage
+        lc_messages = []
+        for msg in cached_messages:
+            if msg['role'] == 'user':
+                lc_messages.append(HumanMessage(content=msg['content']))
+            elif msg['role'] == 'assistant':
+                lc_messages.append(AIMessage(content=msg['content']))
+        
+        # Add new user message
+        lc_messages.append(HumanMessage(content=request.message))
+        
         initial_state: AgentState = {
-            "messages": [HumanMessage(content=request.message)],
+            "messages": lc_messages,
             "chat_id": chat_id,
             "session_id": session_id,
             "user_id": user_id,
@@ -118,13 +151,8 @@ async def chat(
             }
         }
         
+        logger.info(f"🤖 Processing message for chat {chat_id}")
         result = await agent_graph.ainvoke(initial_state, config)
-        
-        # FORCE SAVE IMMEDIATELY after each interaction
-        saved_count = await chat_manager.save_pending_messages(
-            chat_id, access_token, refresh_token, force=True
-        )
-        logger.info(f"Force saved {saved_count} messages after chat interaction")
         
         # Extract AI response
         ai_response = result["messages"][-1].content if result["messages"] else "No response generated"
@@ -137,7 +165,38 @@ async def chat(
         )
         
     except Exception as e:
-        logger.error(f"Chat error: {e}")
+        logger.error(f"❌ Chat error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/chat/switch")
+async def switch_chat(
+    old_chat_id: Optional[str],
+    new_chat_id: str,
+    access_token: str,
+    refresh_token: str
+):
+    """Switch from one chat to another (saves old, loads new)"""
+    
+    try:
+        user_id = await get_user_from_token(access_token)
+        
+        chat_info = await chat_manager.switch_chat(
+            old_chat_id=old_chat_id,
+            new_chat_id=new_chat_id,
+            user_id=user_id,
+            access_token=access_token,
+            refresh_token=refresh_token
+        )
+        
+        return {
+            "status": "success",
+            "chat_id": new_chat_id,
+            "message_count": len(chat_info['messages'])
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error switching chat: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -147,7 +206,7 @@ async def get_chat_history(
     refresh_token: str,
     limit: int = 50
 ):
-    """Get all chats for the authenticated user"""
+    """Get all chats for the authenticated user (metadata only)"""
     
     try:
         user_id = await get_user_from_token(access_token)
@@ -165,7 +224,7 @@ async def get_chat_history(
         )
         
     except Exception as e:
-        logger.error(f"Error loading chat history: {e}")
+        logger.error(f"❌ Error loading chat history: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -173,27 +232,40 @@ async def get_chat_history(
 async def get_chat_messages(
     chat_id: str,
     access_token: str,
-    refresh_token: str,
-    limit: int = 100
+    refresh_token: str
 ):
-    """Get messages for a specific chat"""
+    """Get messages for a specific chat (from cache or DB)"""
     
     try:
-        messages = await chat_manager.load_chat_messages(
+        user_id = await get_user_from_token(access_token)
+        
+        # Try cache first
+        cached = chat_manager.get_cached_messages(chat_id)
+        
+        if cached:
+            logger.info(f"📦 Returning cached messages for {chat_id}")
+            return MessageHistoryResponse(
+                messages=cached,
+                chat_id=chat_id,
+                total=len(cached)
+            )
+        
+        # Load from DB
+        chat_info = await chat_manager.get_or_load_chat(
             chat_id=chat_id,
+            user_id=user_id,
             access_token=access_token,
-            refresh_token=refresh_token,
-            limit=limit
+            refresh_token=refresh_token
         )
         
         return MessageHistoryResponse(
-            messages=messages,
+            messages=chat_info['messages'],
             chat_id=chat_id,
-            total=len(messages)
+            total=len(chat_info['messages'])
         )
         
     except Exception as e:
-        logger.error(f"Error loading messages: {e}")
+        logger.error(f"❌ Error loading messages: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -203,7 +275,7 @@ async def end_chat_session(
     access_token: str,
     refresh_token: str
 ):
-    """End session and save all pending messages"""
+    """End session and save all cached messages"""
     
     try:
         await chat_manager.end_session(
@@ -215,5 +287,32 @@ async def end_chat_session(
         return {"status": "success", "message": "Session ended and messages saved"}
         
     except Exception as e:
-        logger.error(f"Error ending session: {e}")
+        logger.error(f"❌ Error ending session: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/query")
+async def run_sql_query(
+    query: str
+):
+    """Run arbitrary SQL query against the database"""
+    from database.client import run_query
+    access_token, refresh_token = await get_access_token(
+        email="vikram.dev@pwc.com",
+        password="Test@123"
+    )
+
+    try:
+        results = await run_query(
+            query=query,
+            access_token=access_token,
+            refresh_token=refresh_token
+        )
+        
+        return {
+            "status": "success",
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ SQL query error: {e}")
         raise HTTPException(status_code=500, detail=str(e))

@@ -95,7 +95,15 @@ async def run_query(
 
             # Execute query
             cur.execute(query)
+            
+            # Commit for INSERT/UPDATE/DELETE
+            if cur.description is None:
+                conn.commit()
+                return []
+
+            # SELECT or INSERT ... RETURNING rows
             rows = cur.fetchall()
+            conn.commit()
 
             # convert rows -> list[dict] using description
             desc = [col.name for col in cur.description] if cur.description else []

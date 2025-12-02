@@ -5,24 +5,22 @@ from database.utils import pg_escape
 from logs.log import logger
 from config import settings
 import uuid
-import time
-
 
 class ChatSessionManager:
-    """Manages chat sessions and enforces limits"""
+    """Manages chat sessions with proper caching and batch saves"""
     
     def __init__(
         self,
         max_context_multiplier: int = 10,
         llm_context_limit: int = 8000,
-        session_timeout_minutes: int = 5,
-        auto_save_interval_minutes: int = 3
+        session_timeout_minutes: int = 5
     ):
         self.max_tokens_per_chat = max_context_multiplier * llm_context_limit
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
-        self.auto_save_interval = timedelta(minutes=auto_save_interval_minutes)
-        self.pending_messages: Dict[str, List[Dict[str, Any]]] = {}
-        self.last_save_time: Dict[str, datetime] = {}
+        
+        # Cache for active chats (in-memory message storage)
+        self.active_chats: Dict[str, Dict[str, Any]] = {}
+        # Format: {chat_id: {'messages': [], 'total_tokens': 0, 'session_id': '', 'last_activity': datetime}}
         
     def generate_chat_id(self) -> str:
         """Generate unique chat ID"""
@@ -32,181 +30,294 @@ class ChatSessionManager:
         """Generate unique session ID"""
         return f"session_{uuid.uuid4().hex[:16]}"
     
-    async def get_or_create_chat(
+    async def create_new_chat(
         self,
         user_id: str,
         access_token: str,
         refresh_token: str,
         topic: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Get existing chat or create new one based on topic"""
+        """Create a new chat in database FIRST, then cache it"""
         
-        # Check for existing active chat with same topic
-        query = f"""
-        SELECT chat_id, topic, total_tokens, created_at
-        FROM chats
-        WHERE user_id = '{pg_escape(user_id)}'
-        AND is_active = true
-        ORDER BY updated_at DESC
-        LIMIT 5;
+        chat_id = self.generate_chat_id()
+        session_id = self.generate_session_id()
+        
+        # INSERT chat into database FIRST
+        insert_query = f"""
+        INSERT INTO chats (chat_id, user_id, topic, total_tokens, is_active, created_at, updated_at)
+        VALUES (
+            '{chat_id}',
+            '{pg_escape(user_id)}',
+            {f"'{pg_escape(topic)}'" if topic else 'NULL'},
+            0,
+            true,
+            NOW(),
+            NOW()
+        )
+        RETURNING chat_id;
         """
         
         try:
-            existing_chats = await run_query(query, access_token, refresh_token)
-            
-            # If topic matches recent chat and under token limit, reuse it
-            if topic and existing_chats:
-                for chat in existing_chats:
-                    if (chat.get('topic') == topic and 
-                        chat.get('total_tokens', 0) < self.max_tokens_per_chat):
-                        logger.info(f"Reusing chat {chat['chat_id']} for topic: {topic}")
-                        return {
-                            'chat_id': chat['chat_id'],
-                            'is_new': False,
-                            'total_tokens': chat.get('total_tokens', 0)
-                        }
-            
-            # Create new chat
-            chat_id = self.generate_chat_id()
-            insert_query = f"""
-            INSERT INTO chats (chat_id, user_id, topic, total_tokens, is_active, created_at, updated_at)
-            VALUES (
-                '{chat_id}',
-                '{pg_escape(user_id)}',
-                {f"'{pg_escape(topic)}'" if topic else 'NULL'},
-                0,
-                true,
-                NOW(),
-                NOW()
-            )
-            RETURNING chat_id;
-            """
-            
             await run_query(insert_query, access_token, refresh_token)
-            logger.info(f"Created new chat {chat_id} for user {user_id}")
+            logger.info(f"✅ Created new chat in DB: {chat_id}")
+            
+            # Initialize in-memory cache
+            self.active_chats[chat_id] = {
+                'messages': [],
+                'total_tokens': 0,
+                'session_id': session_id,
+                'last_activity': datetime.utcnow(),
+                'user_id': user_id,
+                'is_new': True
+            }
             
             return {
                 'chat_id': chat_id,
+                'session_id': session_id,
                 'is_new': True,
                 'total_tokens': 0
             }
             
         except Exception as e:
-            logger.error(f"Error in get_or_create_chat: {e}")
+            logger.error(f"❌ Error creating chat: {e}")
             raise
     
-    async def check_token_limit(
+    async def get_or_load_chat(
         self,
         chat_id: str,
+        user_id: str,
         access_token: str,
         refresh_token: str
-    ) -> bool:
-        """Check if chat has exceeded token limit"""
+    ) -> Dict[str, Any]:
+        """Load existing chat from DB if not in cache"""
         
-        query = f"""
-        SELECT total_tokens
+        # Check if already cached
+        if chat_id in self.active_chats:
+            logger.info(f"📦 Using cached chat: {chat_id}")
+            return {
+                'chat_id': chat_id,
+                'session_id': self.active_chats[chat_id]['session_id'],
+                'is_new': False,
+                'total_tokens': self.active_chats[chat_id]['total_tokens'],
+                'messages': self.active_chats[chat_id]['messages']
+            }
+        
+        # Load from database
+        logger.info(f"💾 Loading chat from DB: {chat_id}")
+        
+        # Get chat metadata
+        chat_query = f"""
+        SELECT chat_id, topic, total_tokens, created_at
         FROM chats
-        WHERE chat_id = '{pg_escape(chat_id)}';
+        WHERE chat_id = '{pg_escape(chat_id)}'
+        AND user_id = '{pg_escape(user_id)}';
         """
         
-        result = await run_query(query, access_token, refresh_token)
+        chat_result = await run_query(chat_query, access_token, refresh_token)
         
-        if result and len(result) > 0:
-            total_tokens = result[0].get('total_tokens', 0)
-            if total_tokens >= self.max_tokens_per_chat:
-                logger.warning(f"Chat {chat_id} exceeded token limit: {total_tokens}/{self.max_tokens_per_chat}")
-                return False
+        if not chat_result:
+            raise ValueError(f"Chat {chat_id} not found or access denied")
         
-        return True
+        # Load messages
+        messages_query = f"""
+        SELECT session_id, role, content, tokens, created_at
+        FROM messages
+        WHERE chat_id = '{pg_escape(chat_id)}'
+        ORDER BY created_at ASC;
+        """
+        
+        messages_result = await run_query(messages_query, access_token, refresh_token)
+        
+        # Cache the loaded chat
+        session_id = self.generate_session_id()  # New session for loaded chat
+        self.active_chats[chat_id] = {
+            'messages': [
+                {
+                    'role': msg['role'],
+                    'content': msg['content'],
+                    'tokens': msg['tokens'],
+                    'session_id': msg['session_id']
+                }
+                for msg in messages_result
+            ],
+            'total_tokens': chat_result[0]['total_tokens'],
+            'session_id': session_id,
+            'last_activity': datetime.utcnow(),
+            'user_id': user_id,
+            'is_new': False
+        }
+        
+        return {
+            'chat_id': chat_id,
+            'session_id': session_id,
+            'is_new': False,
+            'total_tokens': self.active_chats[chat_id]['total_tokens'],
+            'messages': self.active_chats[chat_id]['messages']
+        }
     
-    def add_pending_message(
+    def add_message_to_cache(
         self,
         chat_id: str,
-        session_id: str,
         role: str,
         content: str,
         tokens: int
     ):
-        """Add message to pending queue"""
+        """Add message to in-memory cache only"""
         
-        if chat_id not in self.pending_messages:
-            self.pending_messages[chat_id] = []
+        if chat_id not in self.active_chats:
+            logger.warning(f"⚠️ Chat {chat_id} not in cache, skipping message")
+            return
         
-        self.pending_messages[chat_id].append({
-            'session_id': session_id,
+        self.active_chats[chat_id]['messages'].append({
             'role': role,
             'content': content,
             'tokens': tokens,
-            'timestamp': datetime.utcnow()
+            'session_id': self.active_chats[chat_id]['session_id']
         })
         
-        logger.info(f"Added pending message for chat {chat_id}, queue size: {len(self.pending_messages[chat_id])}")
-    
-    async def should_auto_save(self, chat_id: str) -> bool:
-        """Check if auto-save interval has passed"""
+        self.active_chats[chat_id]['total_tokens'] += tokens
+        self.active_chats[chat_id]['last_activity'] = datetime.utcnow()
         
-        if chat_id not in self.last_save_time:
+        logger.info(f"📝 Message cached for {chat_id} (total: {len(self.active_chats[chat_id]['messages'])} msgs)")
+    
+    async def check_token_limit(self, chat_id: str) -> bool:
+        """Check if chat has exceeded token limit (from cache)"""
+        
+        if chat_id not in self.active_chats:
             return True
         
-        time_since_save = datetime.utcnow() - self.last_save_time[chat_id]
-        return time_since_save >= self.auto_save_interval
+        total_tokens = self.active_chats[chat_id]['total_tokens']
+        
+        if total_tokens >= self.max_tokens_per_chat:
+            logger.warning(f"⚠️ Chat {chat_id} exceeded limit: {total_tokens}/{self.max_tokens_per_chat}")
+            return False
+        
+        return True
     
-    async def save_pending_messages(
+    async def save_chat_to_db(
         self,
         chat_id: str,
         access_token: str,
-        refresh_token: str,
-        force: bool = False
+        refresh_token: str
     ) -> int:
-        """Save pending messages to database"""
+        """Batch save all cached messages to database"""
         
-        if chat_id not in self.pending_messages or not self.pending_messages[chat_id]:
+        if chat_id not in self.active_chats:
+            logger.warning(f"⚠️ No cached data for chat {chat_id}")
             return 0
         
-        # Check if should save
-        if not force and not await self.should_auto_save(chat_id):
-            return 0
+        cached = self.active_chats[chat_id]
+        messages = cached['messages']
         
-        messages = self.pending_messages[chat_id]
-        total_tokens = sum(msg['tokens'] for msg in messages)
+        if not messages:
+            logger.info(f"ℹ️ No messages to save for {chat_id}")
+            return 0
         
         try:
-            # Insert messages
+            # Check if chat was newly created (only has cached messages)
+            if cached.get('is_new', False):
+                # All messages are new, insert all
+                new_messages = messages
+            else:
+                # Load existing message count from DB
+                count_query = f"""
+                SELECT COUNT(*) as count
+                FROM messages
+                WHERE chat_id = '{pg_escape(chat_id)}';
+                """
+                count_result = await run_query(count_query, access_token, refresh_token)
+                existing_count = count_result[0]['count'] if count_result else 0
+                
+                # Only save messages that aren't in DB yet
+                new_messages = messages[existing_count:]
+            
+            if not new_messages:
+                logger.info(f"ℹ️ All messages already saved for {chat_id}")
+                return 0
+            
+            # Batch insert new messages
             values = []
-            for msg in messages:
+            total_new_tokens = 0
+            
+            for msg in new_messages:
                 values.append(
                     f"('{chat_id}', '{msg['session_id']}', '{pg_escape(msg['role'])}', "
-                    f"'{pg_escape(msg['content'])}', {msg['tokens']}, '{msg['timestamp'].isoformat()}')"
+                    f"'{pg_escape(msg['content'])}', {msg['tokens']}, NOW())"
                 )
+                total_new_tokens += msg['tokens']
             
             insert_query = f"""
             INSERT INTO messages (chat_id, session_id, role, content, tokens, created_at)
             VALUES {', '.join(values)};
             """
-            print("insert_query: ", insert_query)
+            
             await run_query(insert_query, access_token, refresh_token)
-            print("insert_query: ", insert_query)
+            
             # Update chat total tokens
             update_query = f"""
             UPDATE chats
-            SET total_tokens = total_tokens + {total_tokens},
+            SET total_tokens = {cached['total_tokens']},
                 updated_at = NOW()
             WHERE chat_id = '{chat_id}';
             """
             
             await run_query(update_query, access_token, refresh_token)
             
-            # Clear pending messages
-            saved_count = len(messages)
-            self.pending_messages[chat_id] = []
-            self.last_save_time[chat_id] = datetime.utcnow()
+            logger.info(f"💾 Saved {len(new_messages)} messages for {chat_id} ({total_new_tokens} tokens)")
             
-            logger.info(f"Saved {saved_count} messages for chat {chat_id}, total tokens: {total_tokens}")
-            return saved_count
+            # Mark as no longer new
+            cached['is_new'] = False
+            
+            return len(new_messages)
             
         except Exception as e:
-            logger.error(f"Error saving messages for chat {chat_id}: {e}")
+            logger.error(f"❌ Error saving chat {chat_id}: {e}")
             raise
+    
+    async def switch_chat(
+        self,
+        old_chat_id: Optional[str],
+        new_chat_id: str,
+        user_id: str,
+        access_token: str,
+        refresh_token: str
+    ):
+        """Save old chat and load new chat"""
+        
+        # Save old chat if exists
+        if old_chat_id and old_chat_id in self.active_chats:
+            logger.info(f"💾 Saving old chat: {old_chat_id}")
+            await self.save_chat_to_db(old_chat_id, access_token, refresh_token)
+        
+        # Load new chat
+        logger.info(f"📂 Loading new chat: {new_chat_id}")
+        return await self.get_or_load_chat(new_chat_id, user_id, access_token, refresh_token)
+    
+    async def end_session(
+        self,
+        chat_id: str,
+        access_token: str,
+        refresh_token: str
+    ):
+        """End session and save everything"""
+        
+        if chat_id in self.active_chats:
+            await self.save_chat_to_db(chat_id, access_token, refresh_token)
+            logger.info(f"✅ Session ended and saved for {chat_id}")
+    
+    async def cleanup_inactive_chats(self):
+        """Remove inactive chats from cache (optional optimization)"""
+        
+        now = datetime.utcnow()
+        inactive = []
+        
+        for chat_id, data in self.active_chats.items():
+            if now - data['last_activity'] > self.session_timeout:
+                inactive.append(chat_id)
+        
+        for chat_id in inactive:
+            del self.active_chats[chat_id]
+            logger.info(f"🗑️ Cleaned up inactive chat: {chat_id}")
     
     async def load_chat_history(
         self,
@@ -215,7 +326,7 @@ class ChatSessionManager:
         refresh_token: str,
         limit: int = 50
     ) -> List[Dict[str, Any]]:
-        """Load all chats for a user"""
+        """Load chat list for user (metadata only)"""
         
         query = f"""
         SELECT 
@@ -236,57 +347,22 @@ class ChatSessionManager:
         
         try:
             chats = await run_query(query, access_token, refresh_token)
-            logger.info(f"Loaded {len(chats)} chats for user {user_id}")
+            logger.info(f"📋 Loaded {len(chats)} chat summaries for user {user_id}")
             return chats
         except Exception as e:
-            logger.error(f"Error loading chat history: {e}")
+            logger.error(f"❌ Error loading chat history: {e}")
             return []
     
-    async def load_chat_messages(
-        self,
-        chat_id: str,
-        access_token: str,
-        refresh_token: str,
-        limit: int = 100
-    ) -> List[Dict[str, Any]]:
-        """Load messages for a specific chat"""
+    def get_cached_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        """Get messages from cache (for display)"""
         
-        query = f"""
-        SELECT 
-            message_id,
-            session_id,
-            role,
-            content,
-            tokens,
-            created_at
-        FROM messages
-        WHERE chat_id = '{pg_escape(chat_id)}'
-        ORDER BY created_at ASC
-        LIMIT {limit};
-        """
+        if chat_id not in self.active_chats:
+            return []
         
-        try:
-            messages = await run_query(query, access_token, refresh_token)
-            logger.info(f"Loaded {len(messages)} messages for chat {chat_id}")
-            return messages
-        except Exception as e:
-            logger.error(f"Error loading messages for chat {chat_id}: {e}")
-            raise
-    
-    async def end_session(
-        self,
-        chat_id: str,
-        access_token: str,
-        refresh_token: str
-    ):
-        """End session and save all pending messages"""
-        
-        await self.save_pending_messages(chat_id, access_token, refresh_token, force=True)
-        logger.info(f"Session ended for chat {chat_id}")
+        return self.active_chats[chat_id]['messages']
 
 
 # Global instance
 chat_manager = ChatSessionManager(
-    session_timeout_minutes=getattr(settings, 'SESSION_TIMEOUT_MINUTES', 5),
-    auto_save_interval_minutes=getattr(settings, 'AUTO_SAVE_INTERVAL_MINUTES', 3)
+    session_timeout_minutes=getattr(settings, 'SESSION_TIMEOUT_MINUTES', 5)
 )
