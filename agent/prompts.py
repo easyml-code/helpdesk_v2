@@ -1,3 +1,8 @@
+from langchain_core.messages import SystemMessage
+from agent.llm import get_llm
+from agent.tools import TOOLS
+from functools import lru_cache
+
 DATABASE_SCHEMA = """
 CREATE TABLE public.invoices (
   invoice_number text NOT NULL,
@@ -43,7 +48,6 @@ CREATE TABLE public.vendors (
 );
 """
 
-# FIXED: Updated to reference correct tool name
 SYSTEM_PROMPT_HELPDESK = f"""
 You are a helpful AI assistant with access to an invoice database.
 
@@ -67,4 +71,33 @@ Example queries:
 - "SELECT * FROM invoices WHERE status = 'pending' ORDER BY due_date"
 - "SELECT vendor_name, SUM(amount) as total FROM invoices JOIN vendors ON invoices.vendor_id = vendors.vendor_id GROUP BY vendor_name"
 - "SELECT * FROM invoices WHERE invoice_date >= '2024-01-01' AND invoice_date < '2025-01-01'"
+
+Context Offloading Instructions:
+When query_database_with_offload returns an "offloaded" status:
+1. You will receive a summary of the results
+2. Use get_context_chunks with session_id and chunk_indices=[0] to retrieve the first chunk
+3. If more data is needed, use the remaining_chunk_indices to fetch additional chunks
+4. ALWAYS retrieve at least the first chunk to provide concrete examples to the user
 """
+
+
+@lru_cache(maxsize=1)
+def get_llm_chain():
+    """
+    Get cached LLM chain with system prompt and tools bound.
+    This is built once and reused across all requests.
+    """
+    llm = get_llm()
+    llm_with_tools = llm.bind_tools(TOOLS)
+    
+    # Create a runnable that prepends system message
+    from langchain_core.runnables import RunnableLambda
+    
+    def add_system_message(messages):
+        """Add system message to the beginning if not present"""
+        if not messages or not isinstance(messages[0], SystemMessage):
+            return [SystemMessage(content=SYSTEM_PROMPT_HELPDESK)] + list(messages)
+        return messages
+    
+    chain = RunnableLambda(add_system_message) | llm_with_tools
+    return chain

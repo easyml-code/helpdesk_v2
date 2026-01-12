@@ -79,6 +79,7 @@ class ChatSessionManager:
                 'messages': [],
                 'cumulative_tokens': {'total': 0, 'input': 0, 'output': 0, 'by_turn': []},
                 'session_id': session_id,
+                'session_start_time': datetime.utcnow(),
                 'last_activity': datetime.utcnow(),
                 'last_save': datetime.utcnow(),
                 'user_id': user_id,
@@ -165,6 +166,7 @@ class ChatSessionManager:
                 'by_turn': turn_history
             },
             'session_id': session_id,
+            'session_start_time': datetime.utcnow(),
             'last_activity': datetime.utcnow(),
             'last_save': datetime.utcnow(),
             'user_id': user_id,
@@ -325,10 +327,68 @@ class ChatSessionManager:
                 logger.error(f"auto_save_error - chat_id={chat_id}, error={e}")
     
     async def end_session(self, chat_id: str, access_token: str, refresh_token: str):
-        """End session and force save"""
-        if chat_id in self.active_chats:
-            await self.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
-            logger.info(f"session_ended - chat_id={chat_id}")
+        """End session, force save, and record metrics"""
+        if chat_id not in self.active_chats:
+            logger.warning(f"end_session_chat_not_found - chat_id={chat_id}")
+            return
+        
+        chat_data = self.active_chats[chat_id]
+        
+        # Force save all messages
+        await self.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
+        
+        # Calculate session metrics
+        session_start = chat_data['session_start_time']
+        session_end = datetime.utcnow()
+        session_duration_seconds = (session_end - session_start).total_seconds()
+        
+        tokens = chat_data['cumulative_tokens']
+        message_count = len(chat_data['messages'])
+        turn_count = len([m for m in chat_data['messages'] if m['role'] == 'user'])
+        
+        # Insert into chat_metrics table
+        metrics_query = f"""
+        INSERT INTO chat_metrics (
+            chat_id,
+            session_id,
+            user_id,
+            session_start_time,
+            session_end_time,
+            session_duration_seconds,
+            total_messages,
+            total_turns,
+            total_tokens,
+            input_tokens,
+            output_tokens,
+            created_at
+        ) VALUES (
+            '{chat_id}',
+            '{chat_data['session_id']}',
+            '{pg_escape(chat_data['user_id'])}',
+            '{session_start.isoformat()}',
+            '{session_end.isoformat()}',
+            {session_duration_seconds},
+            {message_count},
+            {turn_count},
+            {tokens['total']},
+            {tokens['input']},
+            {tokens['output']},
+            NOW()
+        );
+        """
+        
+        try:
+            await run_query(metrics_query, access_token, refresh_token)
+            logger.info(
+                f"session_ended_metrics_saved - chat_id={chat_id}, "
+                f"duration={session_duration_seconds:.1f}s, messages={message_count}, "
+                f"turns={turn_count}, tokens={tokens['total']}"
+            )
+        except Exception as e:
+            logger.error(f"session_metrics_save_error - chat_id={chat_id}, error={e}", exc_info=True)
+        
+        # Keep chat in cache but mark as inactive
+        logger.info(f"session_ended - chat_id={chat_id}")
     
     async def load_chat_history(
         self,
@@ -394,6 +454,37 @@ class ChatSessionManager:
         if chat_id not in self.active_chats:
             return []
         return self.active_chats[chat_id]['messages']
+    
+    async def get_user_metrics(
+        self,
+        user_id: str,
+        access_token: str,
+        refresh_token: str
+    ) -> Dict[str, Any]:
+        """Get aggregate metrics for a user"""
+        
+        query = f"""
+        SELECT 
+            COUNT(DISTINCT chat_id) as total_chats,
+            SUM(total_messages) as total_messages,
+            SUM(total_turns) as total_turns,
+            SUM(total_tokens) as total_tokens,
+            SUM(input_tokens) as total_input_tokens,
+            SUM(output_tokens) as total_output_tokens,
+            AVG(session_duration_seconds) as avg_session_duration,
+            MAX(session_end_time) as last_activity
+        FROM chat_metrics
+        WHERE user_id = '{pg_escape(user_id)}';
+        """
+        
+        try:
+            result = await run_query(query, access_token, refresh_token)
+            if result:
+                return result[0]
+            return {}
+        except Exception as e:
+            logger.error(f"user_metrics_error - error={e}", exc_info=True)
+            return {}
 
 
 # Global instance

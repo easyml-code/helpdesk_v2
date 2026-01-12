@@ -3,7 +3,7 @@ from agent.state import AgentState
 from langchain_core.runnables import RunnableConfig
 from agent.llm import get_llm
 from agent.chat_manager import chat_manager
-from agent.prompts import SYSTEM_PROMPT_HELPDESK
+from agent.prompts import get_llm_chain  # NEW: Get cached chain
 from logs.log import logger, log_llm_call, set_trace_id, set_request_id
 from metrics.prometheus import (
     track_llm_call, chat_messages_total, 
@@ -36,11 +36,13 @@ async def process_input(state: AgentState, config: RunnableConfig) -> AgentState
                 f"cumulative_total={stats.get('total', 0)}"
             )
             
-            state["messages"].append(
-                AIMessage(content="This chat has reached its maximum length. Please start a new chat.")
-            )
-            track_error("token_limit_exceeded", "chat")
-            return state
+            # Return error message WITHOUT adding to state
+            return {
+                **state,
+                "messages": state["messages"] + [
+                    AIMessage(content="This chat has reached its maximum length. Please start a new chat.")
+                ]
+            }
     
     logger.info(f"input_validated - chat_id={chat_id}")
     return state
@@ -50,22 +52,18 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
     """Generate AI response using LLM with tool support"""
     
     start_time = time.time()
-    llm = get_llm()
     messages = state["messages"]
     chat_id = state["chat_id"]
     
-    # Bind tools to LLM
-    llm_with_tools = llm.bind_tools(TOOLS)
+    # Use cached LLM chain (includes system prompt + tools)
+    llm_chain = get_llm_chain()
     
-    # Build message list with system prompt
-    system_msg = SystemMessage(content=SYSTEM_PROMPT_HELPDESK)
-    
-    # Apply windowing (keep recent messages)
+    # Apply windowing to INPUT messages only (not state messages)
+    # State messages are already managed by AsyncWindowedCheckpointer
     recent_messages = messages[-6:] if len(messages) > 6 else messages
-    full_messages = [system_msg] + list(recent_messages)
     
     logger.info(
-        f"llm_invoke_start - chat_id={chat_id}, input_messages={len(full_messages)}"
+        f"llm_invoke_start - chat_id={chat_id}, input_messages={len(recent_messages)}"
     )
     
     try:
@@ -76,8 +74,8 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 user_msg_content = msg.content
                 break
         
-        # Invoke LLM with tools
-        response = await llm_with_tools.ainvoke(full_messages, config=config)
+        # Invoke LLM chain with only recent messages
+        response = await llm_chain.ainvoke(recent_messages, config=config)
         
         # Extract token usage
         metadata = response.response_metadata.get("token_usage", {})
@@ -95,7 +93,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         
         # Fallback estimation if no token info
         if input_tokens == 0 and output_tokens == 0:
-            input_tokens = sum(len(str(m.content)) for m in full_messages) // 4
+            input_tokens = sum(len(str(m.content)) for m in recent_messages) // 4
             output_tokens = len(str(response.content)) // 4
             logger.warning(
                 f"token_estimation_used - chat_id={chat_id}, "
@@ -103,9 +101,6 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             )
         
         latency_ms = (time.time() - start_time) * 1000
-        
-        # Add AI response to state
-        state["messages"].append(response)
         
         # Track metrics
         from config import settings
@@ -125,9 +120,10 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         )
         
         chat_messages_total.labels(role="assistant").inc()
+        ai_content = response.content if hasattr(response, 'content') else str(response)
         
         # Cache messages with proper token counts
-        if user_msg_content:
+        if isinstance(messages[-1], HumanMessage) and user_msg_content:
             # Cache user message with input tokens
             chat_manager.add_message_to_cache(
                 chat_id=chat_id,
@@ -151,7 +147,22 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             
             # Track in Prometheus
             chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
-        
+        elif ai_content!= "":
+            # Cache assistant message with output tokens
+            chat_manager.add_message_to_cache(
+                chat_id=chat_id,
+                role="assistant",
+                content=ai_content,
+                tokens=output_tokens
+            )
+            
+            # Update state with cumulative total
+            stats_after = chat_manager.get_token_stats(chat_id)
+            state["total_tokens"] = stats_after.get('total', 0)
+            
+            # Track in Prometheus
+            chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
+
         logger.info(
             f"llm_response_generated - chat_id={chat_id}, "
             f"input_tokens={input_tokens}, output_tokens={output_tokens}, "
@@ -159,6 +170,9 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             f"cumulative_total={state.get('total_tokens', 0)}, "
             f"latency_ms={latency_ms:.2f}"
         )
+        
+        # Return only the NEW message (LangGraph will add it to state)
+        return {"messages": [response]}
         
     except Exception as e:
         latency_ms = (time.time() - start_time) * 1000
@@ -176,11 +190,11 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         )
         track_error("llm_invocation_error", "agent")
         
-        state["messages"].append(
-            AIMessage(content="I apologize, but I encountered an error. Please try again.")
-        )
-    
-    return state
+        return {
+            "messages": [
+                AIMessage(content="I apologize, but I encountered an error. Please try again.")
+            ]
+        }
 
 
 async def save_messages(state: AgentState, config: RunnableConfig) -> AgentState:

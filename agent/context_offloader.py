@@ -1,5 +1,5 @@
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, date
 import json
 import uuid
 from logs.log import logger
@@ -8,6 +8,14 @@ from metrics.prometheus import (
     track_context_offload,
     track_chunk_retrieval
 )
+
+
+class DateTimeEncoder(json.JSONEncoder):
+    """Custom JSON encoder for datetime and date objects"""
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        return super().default(obj)
 
 
 class InMemoryContextOffloader:
@@ -30,7 +38,8 @@ class InMemoryContextOffloader:
         current_size = 0
         
         for row in rows:
-            row_str = json.dumps(row)
+            # Use custom encoder for datetime/date objects
+            row_str = json.dumps(row, cls=DateTimeEncoder)
             row_size = len(row_str)
             
             # Single row exceeds context size - put in own chunk
@@ -57,6 +66,12 @@ class InMemoryContextOffloader:
         
         return chunks
     
+    def _serialize_value(self, value):
+        """Serialize datetime/date objects for summary"""
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        return value
+    
     def _calculate_summary(self, rows: List[Dict], year_filter: Optional[int]) -> Dict[str, Any]:
         """Calculate summary statistics from all rows before chunking"""
         if not rows:
@@ -70,10 +85,17 @@ class InMemoryContextOffloader:
             }
         
         # Calculate totals
-        total_amount = sum(row.get("amount", 0) for row in rows)
+        total_amount = sum(row.get("amount", 0) or 0 for row in rows)
         
-        # Extract dates
-        dates = [row.get("date") for row in rows if row.get("date")]
+        # Extract dates (handle datetime and date objects)
+        dates = []
+        for row in rows:
+            date_val = row.get("date") or row.get("invoice_date") or row.get("due_date")
+            if date_val:
+                if isinstance(date_val, str):
+                    dates.append(date_val)
+                elif isinstance(date_val, (datetime, date)):
+                    dates.append(date_val.isoformat())
         
         # Status distribution
         status_dist = {}
@@ -224,6 +246,9 @@ class InMemoryContextOffloader:
             f"retrieved={retrieved_count}/{total_chunks}"
         )
         
+        # Serialize data with custom encoder
+        serialized_data = json.loads(json.dumps(chunks_data, cls=DateTimeEncoder))
+        
         return {
             "status": "success",
             "session_id": session_id,
@@ -232,7 +257,7 @@ class InMemoryContextOffloader:
             "total_chunks_available": total_chunks,
             "chunks_remaining": len(remaining_indices),
             "remaining_chunk_indices": remaining_indices,
-            "data": chunks_data,
+            "data": serialized_data,
             "retrieval_progress": {
                 "chunks_retrieved": retrieved_count,
                 "total_chunks": total_chunks,
