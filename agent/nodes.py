@@ -1,9 +1,8 @@
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from agent.state import AgentState
 from langchain_core.runnables import RunnableConfig
-from agent.llm import get_llm
 from agent.chat_manager import chat_manager
-from agent.prompts import get_llm_chain  # NEW: Get cached chain
+from agent.prompts import get_llm_chain
 from logs.log import logger, log_llm_call, set_trace_id, set_request_id
 from metrics.prometheus import (
     track_llm_call, chat_messages_total, 
@@ -58,12 +57,11 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
     # Use cached LLM chain (includes system prompt + tools)
     llm_chain = get_llm_chain()
     
-    # Apply windowing to INPUT messages only (not state messages)
-    # State messages are already managed by AsyncWindowedCheckpointer
-    recent_messages = messages[-6:] if len(messages) > 6 else messages
+    # NO WINDOWING HERE - AsyncWindowedCheckpointer handles it in graph
+    # Just pass all messages as-is
     
     logger.info(
-        f"llm_invoke_start - chat_id={chat_id}, input_messages={len(recent_messages)}"
+        f"llm_invoke_start - chat_id={chat_id}, total_messages={len(messages)}"
     )
     
     try:
@@ -74,8 +72,8 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 user_msg_content = msg.content
                 break
         
-        # Invoke LLM chain with only recent messages
-        response = await llm_chain.ainvoke(recent_messages, config=config)
+        # Invoke LLM chain with all messages (checkpointer handles windowing)
+        response = await llm_chain.ainvoke(messages, config=config)
         
         # Extract token usage
         metadata = response.response_metadata.get("token_usage", {})
@@ -93,7 +91,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         
         # Fallback estimation if no token info
         if input_tokens == 0 and output_tokens == 0:
-            input_tokens = sum(len(str(m.content)) for m in recent_messages) // 4
+            input_tokens = sum(len(str(m.content)) for m in messages) // 4
             output_tokens = len(str(response.content)) // 4
             logger.warning(
                 f"token_estimation_used - chat_id={chat_id}, "
@@ -102,7 +100,10 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         
         latency_ms = (time.time() - start_time) * 1000
         
-        # Track metrics
+        # Track metrics in chat_manager
+        chat_manager.track_llm_call(chat_id, latency_ms, success=True)
+        
+        # Track metrics in Prometheus
         from config import settings
         track_llm_call(
             model=settings.LLM_MODEL,
@@ -133,7 +134,6 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             )
             
             # Cache assistant message with output tokens
-            ai_content = response.content if hasattr(response, 'content') else str(response)
             chat_manager.add_message_to_cache(
                 chat_id=chat_id,
                 role="assistant",
@@ -147,7 +147,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             
             # Track in Prometheus
             chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
-        elif ai_content!= "":
+        elif ai_content != "":
             # Cache assistant message with output tokens
             chat_manager.add_message_to_cache(
                 chat_id=chat_id,
@@ -161,7 +161,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             state["total_tokens"] = stats_after.get('total', 0)
             
             # Track in Prometheus
-            chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
+            chat_tokens_total.labels(chat_id=chat_id).inc(output_tokens)
 
         logger.info(
             f"llm_response_generated - chat_id={chat_id}, "
@@ -180,6 +180,9 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             f"llm_error - chat_id={chat_id}, latency_ms={latency_ms:.2f}, error={e}",
             exc_info=True
         )
+        
+        # Track error
+        chat_manager.track_llm_call(chat_id, latency_ms, success=False)
         
         track_llm_call(
             model="unknown",
@@ -217,11 +220,16 @@ async def save_messages(state: AgentState, config: RunnableConfig) -> AgentState
 def route_after_llm(state: AgentState) -> str:
     """Route to tools if LLM made tool calls, otherwise save"""
     last_message = state["messages"][-1]
+    chat_id = state["chat_id"]
 
     if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         tool_names = [tc.get('name', 'unknown') for tc in last_message.tool_calls]
         logger.info(f"routing_to_tools - tools={tool_names}")
         chat_messages_total.labels(role="tool").inc()
+        
+        # Track tool execution
+        chat_manager.track_tool_execution(chat_id)
+        
         return "tools"
     
     return "save"

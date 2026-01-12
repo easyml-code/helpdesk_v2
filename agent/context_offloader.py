@@ -9,12 +9,13 @@ from metrics.prometheus import (
     track_chunk_retrieval
 )
 
-
 class DateTimeEncoder(json.JSONEncoder):
-    """Custom JSON encoder for datetime and date objects"""
+    """Custom JSON encoder for datetime, date, UUID objects"""
     def default(self, obj):
         if isinstance(obj, (datetime, date)):
             return obj.isoformat()
+        if isinstance(obj, uuid.UUID):
+            return str(obj)
         return super().default(obj)
 
 

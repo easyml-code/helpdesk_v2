@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Header, Cookie, Response, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Depends, Header, Cookie, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Optional
 from langchain_core.messages import HumanMessage, AIMessage
@@ -51,15 +51,25 @@ class MessageHistoryResponse(BaseModel):
     total: int
 
 
-class VersionSwitchRequest(BaseModel):
-    logical_message_id: str
-    target_version_id: str
+class UserMetricsResponse(BaseModel):
+    total_chats: int
+    total_messages: int
+    total_tokens: int
+    total_input_tokens: int
+    total_output_tokens: int
+    avg_latency_ms: float
+    total_tool_executions: int
+    last_activity: Optional[str]
 
 
-class MessageVersionsResponse(BaseModel):
-    logical_message_id: str
-    versions: List[dict]
-    active_version_id: str
+class SystemMetricsResponse(BaseModel):
+    total_chats: int
+    total_users: int
+    total_messages: int
+    total_tokens: int
+    avg_latency_ms: float
+    total_tool_executions: int
+    total_errors: int
 
 
 # ============================================================================
@@ -113,14 +123,6 @@ async def background_save_chat(chat_id: str, access_token: str, refresh_token: s
         await chat_manager.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
     except Exception as e:
         logger.error(f"background_save_error - chat_id={chat_id}, error={e}")
-
-
-async def periodic_auto_save(access_token: str, refresh_token: str):
-    """Periodic auto-save for all active chats"""
-    try:
-        await chat_manager.auto_save_all(access_token, refresh_token)
-    except Exception as e:
-        logger.error(f"periodic_auto_save_error - error={e}")
 
 
 # ============================================================================
@@ -194,6 +196,9 @@ async def chat(
             chat_id = chat_info['chat_id']
             is_new_chat = True
             logger.info(f"chat_created - chat_id={chat_id}")
+            
+            # Create cache session
+            cache_manager.create_chat_session(chat_id, user_id, chat_info['session_id'])
         
         # Track active chats
         active_chats_gauge.inc()
@@ -276,7 +281,7 @@ async def end_chat(
     chat_id: str,
     tokens: dict = Depends(authenticate_user)
 ):
-    """End chat session and force save"""
+    """End chat session, force save messages and metrics"""
     start_time = time.time()
     set_trace_id()
     
@@ -284,6 +289,7 @@ async def end_chat(
         user_id = await get_user_from_token(tokens["access_token"])
         set_user_id(user_id)
         
+        # End session (saves messages + metrics)
         await chat_manager.end_session(
             chat_id,
             tokens["access_token"],
@@ -295,7 +301,7 @@ async def end_chat(
         return {
             "status": "success",
             "chat_id": chat_id,
-            "message": "Chat session ended and saved"
+            "message": "Chat session ended, messages and metrics saved"
         }
         
     except Exception as e:
@@ -377,13 +383,15 @@ async def get_chat_messages(
         clear_context()
 
 
-@router.post("/chat/{chat_id}/version/switch")
-async def switch_message_version(
-    chat_id: str,
-    request: VersionSwitchRequest,
+# ============================================================================
+# METRICS ENDPOINTS
+# ============================================================================
+
+@router.get("/metrics/user", response_model=UserMetricsResponse)
+async def get_user_metrics(
     tokens: dict = Depends(authenticate_user)
 ):
-    """Switch to a different version of a message"""
+    """Get aggregate metrics for current user"""
     start_time = time.time()
     set_trace_id()
     
@@ -391,81 +399,75 @@ async def switch_message_version(
         user_id = await get_user_from_token(tokens["access_token"])
         set_user_id(user_id)
         
-        success = cache_manager.switch_message_version(
-            chat_id=chat_id,
-            logical_msg_id=request.logical_message_id,
-            target_version_id=request.target_version_id
+        metrics = await chat_manager.get_user_metrics(
+            user_id,
+            tokens["access_token"],
+            tokens["refresh_token"]
         )
         
-        if not success:
-            await track_request(f"/chat/{chat_id}/version/switch", "POST", start_time, 404)
-            raise HTTPException(status_code=404, detail="Version not found")
+        await track_request("/metrics/user", "GET", start_time, 200)
         
-        await track_request(f"/chat/{chat_id}/version/switch", "POST", start_time, 200)
+        return UserMetricsResponse(
+            total_chats=metrics.get('total_chats', 0),
+            total_messages=metrics.get('total_messages', 0),
+            total_tokens=metrics.get('total_tokens', 0),
+            total_input_tokens=metrics.get('total_input_tokens', 0),
+            total_output_tokens=metrics.get('total_output_tokens', 0),
+            avg_latency_ms=metrics.get('avg_latency_ms', 0),
+            total_tool_executions=metrics.get('total_tool_executions', 0),
+            last_activity=metrics.get('last_activity')
+        )
         
-        return {
-            "status": "success",
-            "chat_id": chat_id,
-            "logical_message_id": request.logical_message_id,
-            "active_version_id": request.target_version_id
-        }
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"version_switch_error - error={e}", exc_info=True)
-        await track_request(f"/chat/{chat_id}/version/switch", "POST", start_time, 500)
+        logger.error(f"user_metrics_error - error={e}", exc_info=True)
+        await track_request("/metrics/user", "GET", start_time, 500)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         clear_context()
 
 
-@router.get("/chat/{chat_id}/message/{message_id}/versions", response_model=MessageVersionsResponse)
-async def get_message_versions(
-    chat_id: str,
-    message_id: str,
+@router.get("/metrics/system", response_model=SystemMetricsResponse)
+async def get_system_metrics(
     tokens: dict = Depends(authenticate_user)
 ):
-    """Get all versions of a specific message"""
+    """Get system-wide metrics (for developers/admins)"""
     start_time = time.time()
     set_trace_id()
     
     try:
+        # In production, you might want to add admin role check here
         user_id = await get_user_from_token(tokens["access_token"])
         set_user_id(user_id)
         
-        versions = cache_manager.get_message_versions(chat_id, message_id)
-        
-        if not versions:
-            await track_request(f"/chat/{chat_id}/message/{message_id}/versions", "GET", start_time, 404)
-            raise HTTPException(status_code=404, detail="Message not found")
-        
-        active_version = next(
-            (v["version_id"] for v in versions if v["is_active"]),
-            versions[0]["version_id"] if versions else None
+        metrics = await chat_manager.get_system_metrics(
+            tokens["access_token"],
+            tokens["refresh_token"]
         )
         
-        await track_request(f"/chat/{chat_id}/message/{message_id}/versions", "GET", start_time, 200)
+        await track_request("/metrics/system", "GET", start_time, 200)
         
-        return MessageVersionsResponse(
-            logical_message_id=message_id,
-            versions=versions,
-            active_version_id=active_version
+        return SystemMetricsResponse(
+            total_chats=metrics.get('total_chats', 0),
+            total_users=metrics.get('total_users', 0),
+            total_messages=metrics.get('total_messages', 0),
+            total_tokens=metrics.get('total_tokens', 0),
+            avg_latency_ms=metrics.get('avg_latency_ms', 0),
+            total_tool_executions=metrics.get('total_tool_executions', 0),
+            total_errors=metrics.get('total_errors', 0)
         )
         
-    except HTTPException:
-        raise
     except Exception as e:
-        logger.error(f"get_versions_error - error={e}", exc_info=True)
-        await track_request(f"/chat/{chat_id}/message/{message_id}/versions", "GET", start_time, 500)
+        logger.error(f"system_metrics_error - error={e}", exc_info=True)
+        await track_request("/metrics/system", "GET", start_time, 500)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         clear_context()
 
 
-@router.get("/metrics")
-async def metrics_endpoint():
+@router.get("/metrics/prometheus")
+async def prometheus_metrics():
     """Prometheus metrics endpoint"""
+    from fastapi.responses import Response
     metrics_data = get_metrics()
     return Response(content=metrics_data, media_type="text/plain")
 

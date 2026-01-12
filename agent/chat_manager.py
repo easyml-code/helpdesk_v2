@@ -11,7 +11,7 @@ from collections import defaultdict
 
 class ChatSessionManager:
     """
-    Manages chat sessions with proper token tracking and async DB persistence.
+    Manages chat sessions with proper token tracking, metrics caching, and async DB persistence.
     """
     
     def __init__(
@@ -31,8 +31,8 @@ class ChatSessionManager:
         # Track unsaved messages per chat
         self.unsaved_messages: Dict[str, List[Dict]] = defaultdict(list)
         
-        # Auto-save task
-        self._auto_save_task = None
+        # Track unsaved metrics per chat
+        self.unsaved_metrics: Dict[str, Dict[str, Any]] = {}
         
         logger.info(
             f"ChatSessionManager initialized - max_tokens={self.max_tokens_per_chat}, "
@@ -83,7 +83,13 @@ class ChatSessionManager:
                 'last_activity': datetime.utcnow(),
                 'last_save': datetime.utcnow(),
                 'user_id': user_id,
-                'is_new': True
+                'is_new': True,
+                'message_count': 0,
+                'turn_count': 0,
+                'tool_execution_count': 0,
+                'error_count': 0,
+                'total_latency_ms': 0,
+                'latency_records': []
             }
             
             return {
@@ -170,7 +176,13 @@ class ChatSessionManager:
             'last_activity': datetime.utcnow(),
             'last_save': datetime.utcnow(),
             'user_id': user_id,
-            'is_new': False
+            'is_new': False,
+            'message_count': len(messages_result),
+            'turn_count': len([m for m in messages_result if m['role'] == 'user']),
+            'tool_execution_count': 0,
+            'error_count': 0,
+            'total_latency_ms': 0,
+            'latency_records': []
         }
         
         logger.info(
@@ -220,6 +232,11 @@ class ChatSessionManager:
             'timestamp': datetime.utcnow().isoformat()
         })
         
+        # Update message count
+        chat_data['message_count'] += 1
+        if role == 'user':
+            chat_data['turn_count'] += 1
+        
         chat_data['last_activity'] = datetime.utcnow()
         
         logger.info(
@@ -227,6 +244,30 @@ class ChatSessionManager:
             f"cumulative_total={chat_data['cumulative_tokens']['total']}, "
             f"unsaved_count={len(self.unsaved_messages[chat_id])}"
         )
+    
+    def track_llm_call(self, chat_id: str, latency_ms: float, success: bool = True):
+        """Track LLM call metrics for a chat"""
+        if chat_id not in self.active_chats:
+            return
+        
+        chat_data = self.active_chats[chat_id]
+        chat_data['total_latency_ms'] += latency_ms
+        chat_data['latency_records'].append(latency_ms)
+        
+        if not success:
+            chat_data['error_count'] += 1
+        
+        logger.debug(f"llm_call_tracked - chat_id={chat_id}, latency_ms={latency_ms}")
+    
+    def track_tool_execution(self, chat_id: str):
+        """Track tool execution for a chat"""
+        if chat_id not in self.active_chats:
+            return
+        
+        chat_data = self.active_chats[chat_id]
+        chat_data['tool_execution_count'] += 1
+        
+        logger.debug(f"tool_execution_tracked - chat_id={chat_id}")
     
     async def check_token_limit(self, chat_id: str) -> bool:
         """Check token limit"""
@@ -318,24 +359,18 @@ class ChatSessionManager:
             logger.error(f"chat_save_error - chat_id={chat_id}, error={e}", exc_info=True)
             raise
     
-    async def auto_save_all(self, access_token: str, refresh_token: str):
-        """Auto-save all chats that need saving"""
-        for chat_id in list(self.active_chats.keys()):
-            try:
-                await self.save_chat_to_db(chat_id, access_token, refresh_token, force=False)
-            except Exception as e:
-                logger.error(f"auto_save_error - chat_id={chat_id}, error={e}")
-    
-    async def end_session(self, chat_id: str, access_token: str, refresh_token: str):
-        """End session, force save, and record metrics"""
+    async def save_session_metrics(
+        self,
+        chat_id: str,
+        access_token: str,
+        refresh_token: str
+    ):
+        """Save session metrics to database"""
         if chat_id not in self.active_chats:
-            logger.warning(f"end_session_chat_not_found - chat_id={chat_id}")
+            logger.warning(f"save_metrics_chat_not_found - chat_id={chat_id}")
             return
         
         chat_data = self.active_chats[chat_id]
-        
-        # Force save all messages
-        await self.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
         
         # Calculate session metrics
         session_start = chat_data['session_start_time']
@@ -343,36 +378,53 @@ class ChatSessionManager:
         session_duration_seconds = (session_end - session_start).total_seconds()
         
         tokens = chat_data['cumulative_tokens']
-        message_count = len(chat_data['messages'])
-        turn_count = len([m for m in chat_data['messages'] if m['role'] == 'user'])
+        message_count = chat_data['message_count']
+        turn_count = chat_data['turn_count']
+        tool_count = chat_data['tool_execution_count']
+        error_count = chat_data['error_count']
+        total_latency = chat_data['total_latency_ms']
+        
+        # Calculate latency stats
+        latency_records = chat_data['latency_records']
+        avg_latency = total_latency / len(latency_records) if latency_records else 0
+        min_latency = min(latency_records) if latency_records else 0
+        max_latency = max(latency_records) if latency_records else 0
         
         # Insert into chat_metrics table
         metrics_query = f"""
         INSERT INTO chat_metrics (
             chat_id,
             session_id,
-            user_id,
-            session_start_time,
-            session_end_time,
-            session_duration_seconds,
-            total_messages,
-            total_turns,
+            total_input_tokens,
+            total_output_tokens,
             total_tokens,
-            input_tokens,
-            output_tokens,
-            created_at
+            total_latency_ms,
+            avg_latency_ms,
+            min_latency_ms,
+            max_latency_ms,
+            message_count,
+            tool_execution_count,
+            error_count,
+            session_start,
+            session_end,
+            created_at,
+            updated_at
         ) VALUES (
             '{chat_id}',
             '{chat_data['session_id']}',
-            '{pg_escape(chat_data['user_id'])}',
-            '{session_start.isoformat()}',
-            '{session_end.isoformat()}',
-            {session_duration_seconds},
-            {message_count},
-            {turn_count},
-            {tokens['total']},
             {tokens['input']},
             {tokens['output']},
+            {tokens['total']},
+            {total_latency},
+            {avg_latency},
+            {min_latency},
+            {max_latency},
+            {message_count},
+            {tool_count},
+            {error_count},
+            '{session_start.isoformat()}',
+            '{session_end.isoformat()}',
+            NOW(),
             NOW()
         );
         """
@@ -380,14 +432,25 @@ class ChatSessionManager:
         try:
             await run_query(metrics_query, access_token, refresh_token)
             logger.info(
-                f"session_ended_metrics_saved - chat_id={chat_id}, "
+                f"session_metrics_saved - chat_id={chat_id}, "
                 f"duration={session_duration_seconds:.1f}s, messages={message_count}, "
                 f"turns={turn_count}, tokens={tokens['total']}"
             )
         except Exception as e:
             logger.error(f"session_metrics_save_error - chat_id={chat_id}, error={e}", exc_info=True)
+    
+    async def end_session(self, chat_id: str, access_token: str, refresh_token: str):
+        """End session, force save, and record metrics"""
+        if chat_id not in self.active_chats:
+            logger.warning(f"end_session_chat_not_found - chat_id={chat_id}")
+            return
         
-        # Keep chat in cache but mark as inactive
+        # Force save all messages
+        await self.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
+        
+        # Save session metrics
+        await self.save_session_metrics(chat_id, access_token, refresh_token)
+        
         logger.info(f"session_ended - chat_id={chat_id}")
     
     async def load_chat_history(
@@ -465,16 +528,17 @@ class ChatSessionManager:
         
         query = f"""
         SELECT 
-            COUNT(DISTINCT chat_id) as total_chats,
-            SUM(total_messages) as total_messages,
-            SUM(total_turns) as total_turns,
-            SUM(total_tokens) as total_tokens,
-            SUM(input_tokens) as total_input_tokens,
-            SUM(output_tokens) as total_output_tokens,
-            AVG(session_duration_seconds) as avg_session_duration,
-            MAX(session_end_time) as last_activity
-        FROM chat_metrics
-        WHERE user_id = '{pg_escape(user_id)}';
+            COUNT(DISTINCT c.chat_id) as total_chats,
+            COALESCE(SUM(cm.message_count), 0) as total_messages,
+            COALESCE(SUM(cm.total_tokens), 0) as total_tokens,
+            COALESCE(SUM(cm.total_input_tokens), 0) as total_input_tokens,
+            COALESCE(SUM(cm.total_output_tokens), 0) as total_output_tokens,
+            COALESCE(AVG(cm.avg_latency_ms), 0) as avg_latency_ms,
+            COALESCE(SUM(cm.tool_execution_count), 0) as total_tool_executions,
+            MAX(cm.session_end) as last_activity
+        FROM chats c
+        LEFT JOIN chat_metrics cm ON c.chat_id = cm.chat_id
+        WHERE c.user_id = '{pg_escape(user_id)}';
         """
         
         try:
@@ -484,6 +548,35 @@ class ChatSessionManager:
             return {}
         except Exception as e:
             logger.error(f"user_metrics_error - error={e}", exc_info=True)
+            return {}
+    
+    async def get_system_metrics(
+        self,
+        access_token: str,
+        refresh_token: str
+    ) -> Dict[str, Any]:
+        """Get system-wide metrics for developers"""
+        
+        query = """
+        SELECT 
+            COUNT(DISTINCT c.chat_id) as total_chats,
+            COUNT(DISTINCT c.user_id) as total_users,
+            COALESCE(SUM(cm.message_count), 0) as total_messages,
+            COALESCE(SUM(cm.total_tokens), 0) as total_tokens,
+            COALESCE(AVG(cm.avg_latency_ms), 0) as avg_latency_ms,
+            COALESCE(SUM(cm.tool_execution_count), 0) as total_tool_executions,
+            COALESCE(SUM(cm.error_count), 0) as total_errors
+        FROM chats c
+        LEFT JOIN chat_metrics cm ON c.chat_id = cm.chat_id;
+        """
+        
+        try:
+            result = await run_query(query, access_token, refresh_token)
+            if result:
+                return result[0]
+            return {}
+        except Exception as e:
+            logger.error(f"system_metrics_error - error={e}", exc_info=True)
             return {}
 
 
