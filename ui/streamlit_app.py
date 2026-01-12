@@ -104,7 +104,7 @@ def load_chat_messages(chat_id: str):
                 for msg in data["messages"]
             ]
             st.session_state.current_chat_id = chat_id
-            st.success(f"✅ Loaded chat: {chat_id[:16]}...")
+            st.success(f"Loaded chat: {chat_id[:16]}...")
         else:
             st.error("Failed to load messages")
     except Exception as e:
@@ -126,6 +126,12 @@ def send_message(message: str, topic: str = None):
                 "X-Refresh-Token": st.session_state.refresh_token
             }
         )
+        if response.status_code == 401:
+            # Session expired
+            save_current_chat()
+            st.session_state.clear()
+            st.error("Session expired. Please login again.")
+            st.rerun()
         
         if response.status_code == 200:
             data = response.json()
@@ -153,7 +159,7 @@ def start_new_chat():
     # Clear state for new chat
     st.session_state.current_chat_id = None
     st.session_state.messages = []
-    st.success("✨ New chat started!")
+    st.success("New chat started!")
 
 
 def main():

@@ -12,17 +12,26 @@ class LLMClient:
     def get_llm(self) -> ChatGroq:
         """Get or create Groq LLM instance"""
         if self._llm is None:
-            self._llm = ChatGroq(
-                model=settings.LLM_MODEl,
-                groq_api_key=settings.GROQ_API_KEY,
-                temperature=settings.LLM_TEMPERATURE,
-                max_tokens=settings.LLM_MAX_TOKENS,
-                timeout=60.0,
-                max_retries=3,
-            )
-            logger.info(f"llm_initialized - model={settings.LLM_MODEl}, provider=groq")
+            try:
+                self._llm = ChatGroq(
+                    model=settings.LLM_MODEL,  # FIXED: Was LLM_MODEl
+                    groq_api_key=settings.GROQ_API_KEY,
+                    temperature=settings.LLM_TEMPERATURE,
+                    max_tokens=settings.LLM_MAX_TOKENS,
+                    timeout=60.0,
+                    max_retries=3,
+                )
+                logger.info(f"llm_initialized - model={settings.LLM_MODEL}, provider=groq")
+            except Exception as e:
+                logger.error(f"llm_initialization_failed - error={e}", exc_info=True)
+                raise
         
         return self._llm
+    
+    def reset_llm(self):
+        """Reset LLM instance (useful for testing or configuration changes)"""
+        self._llm = None
+        logger.info("llm_instance_reset")
 
 
 # Global instance

@@ -2,6 +2,10 @@
 test.ipynb
 .ipynb_checkpoints/
 
+test
+/test
+/test/test.ipynb
+
 .vscode/
 /__pycache__
 __pycache__/

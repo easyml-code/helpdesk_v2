@@ -1,5 +1,5 @@
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from agent.checkpointer import WindowedCheckpointer, AdaptiveWindowedCheckpointer
 from langchain_core.runnables import RunnableConfig
 from agent.state import AgentState
 from agent.nodes import (
@@ -11,10 +11,17 @@ from agent.nodes import (
     tool_node
 )
 from logs.log import logger
+from config import settings
 
 
-def create_agent_graph():
-    """Create the agent workflow graph"""
+def create_agent_graph(use_adaptive: bool = True, window_size: int = 10):
+    """
+    Create the agent workflow graph with windowed checkpointing
+    
+    Args:
+        use_adaptive: Use adaptive windowing based on tokens (default: True)
+        window_size: Base window size for messages (default: 10)
+    """
     
     workflow = StateGraph(AgentState)
     
@@ -46,13 +53,32 @@ def create_agent_graph():
     # End after saving
     workflow.add_edge("save_messages", END)
     
+    # Create checkpointer based on configuration
+    if use_adaptive:
+        checkpointer = AdaptiveWindowedCheckpointer(
+            base_window_size=window_size,
+            max_window_tokens=getattr(settings, 'MAX_WINDOW_TOKENS', 8000),
+            min_window_size=max(4, window_size // 2)
+        )
+        logger.info(
+            f"agent_graph_created - checkpointer=adaptive, "
+            f"window_size={window_size}, max_tokens={settings.LLM_MAX_TOKENS}"
+        )
+    else:
+        checkpointer = WindowedCheckpointer(window_size=window_size)
+        logger.info(
+            f"agent_graph_created - checkpointer=windowed, window_size={window_size}"
+        )
+    
     # Compile with checkpointer
-    checkpointer = MemorySaver()
     app = workflow.compile(checkpointer=checkpointer)
     
-    logger.info("✅ Agent graph created with tool support")
+    logger.info("agent_graph_compiled_with_tools_and_windowing")
     return app
 
 
-# Global graph instance
-agent_graph = create_agent_graph()
+# Global graph instance with default settings
+agent_graph = create_agent_graph(
+    use_adaptive=True,
+    window_size=getattr(settings, 'CHECKPOINT_WINDOW_SIZE', 10)
+)

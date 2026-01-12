@@ -18,16 +18,35 @@ class Settings(BaseSettings):
     
     # LLM Config
     GROQ_API_KEY: str
-    LLM_MODEl: str = "llama-3.3-70b-versatile"
+    LLM_MODEL: str  # FIXED: Was LLM_MODEl
     LLM_TEMPERATURE: float = 0.7
     LLM_MAX_TOKENS: int = 8000
     
     # Chat Session Config
-    MAX_CONTEXT_MULTIPLIER: int = 10  # Chat limit = 10 * LLM_MAX_TOKENS
-    SESSION_TIMEOUT_MINUTES: int = 5  # Session ends after 5 minutes of inactivity
-    AUTO_SAVE_INTERVAL_MINUTES: int = 3  # Auto-save messages every 3 minutes
-    CHAT_HISTORY_LIMIT: int = 50  # Number of recent chats to load
-    MESSAGE_HISTORY_LIMIT: int = 100  # Number of messages to load per chat
+    MAX_CONTEXT_MULTIPLIER: int = 10
+    SESSION_TIMEOUT_MINUTES: int = 55
+    AUTO_SAVE_INTERVAL_MINUTES: int = 5
+    CHAT_HISTORY_LIMIT: int = 50
+    MESSAGE_HISTORY_LIMIT: int = 100
+    
+    # Checkpointing Config
+    CHECKPOINT_WINDOW_SIZE: int = 10
+    MAX_WINDOW_TOKENS: int = 8000
+    USE_ADAPTIVE_WINDOWING: bool = True
+    
+    # Cache Config
+    CACHE_MESSAGE_VERSIONS: bool = True
+    MAX_VERSION_HISTORY: int = 5
+    
+    # Metrics Config
+    ENABLE_METRICS: bool = True
+    METRICS_PORT: int = 9090
+    
+    # Logging Config
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"
+    LOG_MAX_SIZE_MB: int = 10
+    LOG_BACKUP_COUNT: int = 10
 
     class Config:
         env_file = ".env"
