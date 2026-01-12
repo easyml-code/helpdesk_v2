@@ -18,14 +18,14 @@ class Settings(BaseSettings):
     
     # LLM Config
     GROQ_API_KEY: str
-    LLM_MODEL: str  # FIXED: Was LLM_MODEl
-    LLM_TEMPERATURE: float = 0.7
+    LLM_MODEL: str  # FIXED: Correct spelling
+    LLM_TEMPERATURE: float = 0
     LLM_MAX_TOKENS: int = 8000
     
     # Chat Session Config
     MAX_CONTEXT_MULTIPLIER: int = 10
-    SESSION_TIMEOUT_MINUTES: int = 55
-    AUTO_SAVE_INTERVAL_MINUTES: int = 5
+    SESSION_TIMEOUT_MINUTES: int = 5
+    AUTO_SAVE_INTERVAL_MINUTES: int = 5  # NEW: Auto-save interval
     CHAT_HISTORY_LIMIT: int = 50
     MESSAGE_HISTORY_LIMIT: int = 100
     

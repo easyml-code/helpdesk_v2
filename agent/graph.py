@@ -1,12 +1,10 @@
 from langgraph.graph import StateGraph, END
-from agent.checkpointer import WindowedCheckpointer, AdaptiveWindowedCheckpointer
-from langchain_core.runnables import RunnableConfig
+from agent.checkpointer import AsyncWindowedCheckpointer, AsyncAdaptiveWindowedCheckpointer
 from agent.state import AgentState
 from agent.nodes import (
     process_input, 
     generate_response, 
     save_messages,
-    should_continue,
     route_after_llm,
     tool_node
 )
@@ -16,11 +14,7 @@ from config import settings
 
 def create_agent_graph(use_adaptive: bool = True, window_size: int = 10):
     """
-    Create the agent workflow graph with windowed checkpointing
-    
-    Args:
-        use_adaptive: Use adaptive windowing based on tokens (default: True)
-        window_size: Base window size for messages (default: 10)
+    Create agent workflow graph with async windowed checkpointing
     """
     
     workflow = StateGraph(AgentState)
@@ -47,37 +41,37 @@ def create_agent_graph(use_adaptive: bool = True, window_size: int = 10):
         }
     )
     
-    # Permanent: tools → back to LLM
+    # tools → back to LLM
     workflow.add_edge("tools", "generate_response")
     
     # End after saving
     workflow.add_edge("save_messages", END)
     
-    # Create checkpointer based on configuration
+    # Create async checkpointer
     if use_adaptive:
-        checkpointer = AdaptiveWindowedCheckpointer(
+        checkpointer = AsyncAdaptiveWindowedCheckpointer(
             base_window_size=window_size,
             max_window_tokens=getattr(settings, 'MAX_WINDOW_TOKENS', 8000),
             min_window_size=max(4, window_size // 2)
         )
         logger.info(
-            f"agent_graph_created - checkpointer=adaptive, "
+            f"agent_graph_created - checkpointer=async_adaptive, "
             f"window_size={window_size}, max_tokens={settings.LLM_MAX_TOKENS}"
         )
     else:
-        checkpointer = WindowedCheckpointer(window_size=window_size)
+        checkpointer = AsyncWindowedCheckpointer(window_size=window_size)
         logger.info(
-            f"agent_graph_created - checkpointer=windowed, window_size={window_size}"
+            f"agent_graph_created - checkpointer=async_windowed, window_size={window_size}"
         )
     
-    # Compile with checkpointer
+    # Compile with async checkpointer
     app = workflow.compile(checkpointer=checkpointer)
     
-    logger.info("agent_graph_compiled_with_tools_and_windowing")
+    logger.info("agent_graph_compiled_with_async_checkpointing")
     return app
 
 
-# Global graph instance with default settings
+# Global graph instance
 agent_graph = create_agent_graph(
     use_adaptive=True,
     window_size=getattr(settings, 'CHECKPOINT_WINDOW_SIZE', 10)

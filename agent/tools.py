@@ -83,7 +83,7 @@ async def query_database_with_offload(
             })
         
         # Small result set - return directly
-        if len(results) <= 100:
+        if len(results) <= 2:
             logger.info(
                 f"tool_exec_complete - tool=query_database, query_hash={query_hash}, "
                 f"rows={len(results)}, duration_ms={duration*1000:.2f}, offload=no"

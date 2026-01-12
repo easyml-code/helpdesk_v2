@@ -330,6 +330,5 @@ class InMemoryContextOffloader:
             return True
         return False
 
-
 # Global instance
-context_offloader = InMemoryContextOffloader(chunk_context_size=2000)
+context_offloader = InMemoryContextOffloader(chunk_context_size=100)

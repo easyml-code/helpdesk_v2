@@ -6,20 +6,9 @@ from collections import defaultdict
 from logs.log import logger
 from metrics.prometheus import Counter, Histogram
 import hashlib
-
-
-# Prometheus metrics for rate limiting
-rate_limit_exceeded_total = Counter(
-    'rate_limit_exceeded_total',
-    'Total rate limit violations',
-    ['endpoint', 'user_id_hash']
-)
-
-rate_limit_window_requests = Histogram(
-    'rate_limit_window_requests',
-    'Requests per user in current window',
-    ['endpoint'],
-    buckets=(1, 5, 10, 20, 50, 100, 200)
+from metrics.prometheus import (
+    rate_limit_exceeded_total,
+    rate_limit_window_requests
 )
 
 

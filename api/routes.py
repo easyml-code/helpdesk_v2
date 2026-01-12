@@ -1,9 +1,10 @@
-from fastapi import APIRouter, HTTPException, Depends, Header, Cookie, Response
+from fastapi import APIRouter, HTTPException, Depends, Header, Cookie, Response, BackgroundTasks
 from pydantic import BaseModel
 from typing import List, Optional
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from agent.graph import agent_graph
 from agent.cache_manager import cache_manager
+from agent.chat_manager import chat_manager
 from agent.state import AgentState
 from database.client import get_access_token
 from logs.log import logger, set_trace_id, set_request_id, set_user_id, clear_context
@@ -16,9 +17,7 @@ from config import settings
 import time
 import jwt
 import hashlib
-from fastapi import Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from database.utils import get_new_tokens
 
 security = HTTPBearer(auto_error=False)
 router = APIRouter()
@@ -105,13 +104,23 @@ def hash_user_id(user_id: str) -> str:
 
 
 # ============================================================================
-# MIDDLEWARE HELPERS
+# BACKGROUND TASKS
 # ============================================================================
 
-async def track_request(endpoint: str, method: str, start_time: float, status: int):
-    """Track HTTP request metrics"""
-    duration = time.time() - start_time
-    track_http_request(method, endpoint, status, duration)
+async def background_save_chat(chat_id: str, access_token: str, refresh_token: str):
+    """Background task to save chat"""
+    try:
+        await chat_manager.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
+    except Exception as e:
+        logger.error(f"background_save_error - chat_id={chat_id}, error={e}")
+
+
+async def periodic_auto_save(access_token: str, refresh_token: str):
+    """Periodic auto-save for all active chats"""
+    try:
+        await chat_manager.auto_save_all(access_token, refresh_token)
+    except Exception as e:
+        logger.error(f"periodic_auto_save_error - error={e}")
 
 
 # ============================================================================
@@ -149,9 +158,10 @@ async def login(email: str, password: str):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
+    background_tasks: BackgroundTasks,
     tokens: dict = Depends(authenticate_user)
 ):
-    """Process chat message"""
+    """Process chat message with auto-save"""
     start_time = time.time()
     set_trace_id()
     set_request_id()
@@ -160,7 +170,7 @@ async def chat(
     refresh_token = tokens["refresh_token"]
 
     try:
-        # Get user ID and set context
+        # Get user ID
         user_id = await get_user_from_token(access_token)
         set_user_id(user_id)
         user_id_hash = hash_user_id(user_id)
@@ -172,35 +182,33 @@ async def chat(
         # Get or create chat
         if request.chat_id:
             chat_id = request.chat_id
+            chat_info = await chat_manager.get_or_load_chat(
+                chat_id, user_id, access_token, refresh_token
+            )
             is_new_chat = False
-            
-            # Ensure chat exists in cache
-            if not cache_manager.get_active_messages(chat_id):
-                cache_manager.create_chat_session(chat_id)
-            
-            logger.info(f"chat_continue - chat_id={chat_id}, user_id_hash={user_id_hash}")
+            logger.info(f"chat_continue - chat_id={chat_id}")
         else:
-            # Create new chat
-            from agent.cache_manager import cache_manager as cm
-            chat_id = cm._generate_id("chat")
-            cache_manager.create_chat_session(chat_id)
+            chat_info = await chat_manager.create_new_chat(
+                user_id, access_token, refresh_token, request.topic
+            )
+            chat_id = chat_info['chat_id']
             is_new_chat = True
-            
-            logger.info(f"chat_created - chat_id={chat_id}, user_id_hash={user_id_hash}")
+            logger.info(f"chat_created - chat_id={chat_id}")
         
         # Track active chats
         active_chats_gauge.inc()
         user_sessions_active.inc()
         
         # Get cached messages
-        cached_messages = cache_manager.get_active_messages(chat_id)
+        cached_messages = chat_manager.get_cached_messages(chat_id)
         
         # Convert to LangChain format
-        from langchain_core.messages import HumanMessage, AIMessage
         lc_messages = []
         for msg in cached_messages:
-            lc_messages.append(HumanMessage(content=msg['user_content']))
-            lc_messages.append(AIMessage(content=msg['assistant_content']))
+            if msg['role'] == 'user':
+                lc_messages.append(HumanMessage(content=msg['content']))
+            elif msg['role'] == 'assistant':
+                lc_messages.append(AIMessage(content=msg['content']))
         
         # Add new user message
         lc_messages.append(HumanMessage(content=request.message))
@@ -219,10 +227,10 @@ async def chat(
         initial_state: AgentState = {
             "messages": lc_messages,
             "chat_id": chat_id,
-            "session_id": f"session_{int(time.time())}",
+            "session_id": chat_info['session_id'],
             "user_id": user_id,
             "current_topic": request.topic,
-            "total_tokens": 0,
+            "total_tokens": chat_info.get('total_tokens', 0),
             "session_start_time": time.time(),
             "config": config["configurable"],
             "results": []
@@ -233,7 +241,15 @@ async def chat(
         result = await agent_graph.ainvoke(initial_state, config)
         
         # Extract response
-        ai_response = result["messages"][-1].content if result["messages"] else "No response generated"
+        ai_response = result["messages"][-1].content if result["messages"] else "No response"
+        
+        # Schedule background save
+        background_tasks.add_task(
+            background_save_chat,
+            chat_id,
+            access_token,
+            refresh_token
+        )
         
         # Track success
         await track_request("/chat", "POST", start_time, 200)
@@ -241,7 +257,7 @@ async def chat(
         return ChatResponse(
             response=ai_response,
             chat_id=chat_id,
-            session_id=initial_state["session_id"],
+            session_id=chat_info['session_id'],
             is_new_chat=is_new_chat
         )
         
@@ -252,6 +268,112 @@ async def chat(
     finally:
         active_chats_gauge.dec()
         user_sessions_active.dec()
+        clear_context()
+
+
+@router.post("/chat/{chat_id}/end")
+async def end_chat(
+    chat_id: str,
+    tokens: dict = Depends(authenticate_user)
+):
+    """End chat session and force save"""
+    start_time = time.time()
+    set_trace_id()
+    
+    try:
+        user_id = await get_user_from_token(tokens["access_token"])
+        set_user_id(user_id)
+        
+        await chat_manager.end_session(
+            chat_id,
+            tokens["access_token"],
+            tokens["refresh_token"]
+        )
+        
+        await track_request(f"/chat/{chat_id}/end", "POST", start_time, 200)
+        
+        return {
+            "status": "success",
+            "chat_id": chat_id,
+            "message": "Chat session ended and saved"
+        }
+        
+    except Exception as e:
+        logger.error(f"end_chat_error - error={e}", exc_info=True)
+        await track_request(f"/chat/{chat_id}/end", "POST", start_time, 500)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        clear_context()
+
+
+@router.get("/chat/history", response_model=ChatHistoryResponse)
+async def get_chat_history(
+    tokens: dict = Depends(authenticate_user)
+):
+    """Get chat history for user"""
+    start_time = time.time()
+    set_trace_id()
+    
+    try:
+        user_id = await get_user_from_token(tokens["access_token"])
+        set_user_id(user_id)
+        
+        chats = await chat_manager.load_chat_history(
+            user_id,
+            tokens["access_token"],
+            tokens["refresh_token"],
+            limit=getattr(settings, 'CHAT_HISTORY_LIMIT', 50)
+        )
+        
+        await track_request("/chat/history", "GET", start_time, 200)
+        
+        return ChatHistoryResponse(
+            chats=chats,
+            total=len(chats)
+        )
+        
+    except Exception as e:
+        logger.error(f"chat_history_error - error={e}", exc_info=True)
+        await track_request("/chat/history", "GET", start_time, 500)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        clear_context()
+
+
+@router.get("/chat/{chat_id}/messages", response_model=MessageHistoryResponse)
+async def get_chat_messages(
+    chat_id: str,
+    tokens: dict = Depends(authenticate_user)
+):
+    """Get messages for a specific chat"""
+    start_time = time.time()
+    set_trace_id()
+    
+    try:
+        user_id = await get_user_from_token(tokens["access_token"])
+        set_user_id(user_id)
+        
+        messages = await chat_manager.load_chat_messages(
+            chat_id,
+            user_id,
+            tokens["access_token"],
+            tokens["refresh_token"],
+            limit=getattr(settings, 'MESSAGE_HISTORY_LIMIT', 100)
+        )
+        
+        await track_request(f"/chat/{chat_id}/messages", "GET", start_time, 200)
+        
+        return MessageHistoryResponse(
+            messages=messages,
+            chat_id=chat_id,
+            total=len(messages)
+        )
+        
+    except Exception as e:
+        logger.error(f"get_messages_error - error={e}", exc_info=True)
+        await track_request(f"/chat/{chat_id}/messages", "GET", start_time, 500)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
         clear_context()
 
 
@@ -318,7 +440,6 @@ async def get_message_versions(
             await track_request(f"/chat/{chat_id}/message/{message_id}/versions", "GET", start_time, 404)
             raise HTTPException(status_code=404, detail="Message not found")
         
-        # Find active version
         active_version = next(
             (v["version_id"] for v in versions if v["is_active"]),
             versions[0]["version_id"] if versions else None
@@ -357,3 +478,13 @@ async def health_check():
         "timestamp": time.time(),
         "active_chats": active_chats_gauge._value._value
     }
+
+
+# ============================================================================
+# HELPER FUNCTION
+# ============================================================================
+
+async def track_request(endpoint: str, method: str, start_time: float, status: int):
+    """Track HTTP request metrics"""
+    duration = time.time() - start_time
+    track_http_request(method, endpoint, status, duration)

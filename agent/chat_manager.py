@@ -5,46 +5,44 @@ from database.utils import pg_escape
 from logs.log import logger
 from config import settings
 import uuid
+import asyncio
+from collections import defaultdict
 
 
 class ChatSessionManager:
     """
-    Manages chat sessions with PROPER token tracking.
-    Fixed: Accumulates tokens correctly across entire chat session.
+    Manages chat sessions with proper token tracking and async DB persistence.
     """
     
     def __init__(
         self,
         max_context_multiplier: int = 100,
         llm_context_limit: int = 8000,
-        session_timeout_minutes: int = 55
+        session_timeout_minutes: int = 55,
+        auto_save_interval_minutes: int = 5
     ):
         self.max_tokens_per_chat = max_context_multiplier * llm_context_limit
         self.session_timeout = timedelta(minutes=session_timeout_minutes)
+        self.auto_save_interval = timedelta(minutes=auto_save_interval_minutes)
         
-        # Cache for active chats
-        # FIXED: Store cumulative token count properly
+        # Active chats cache
         self.active_chats: Dict[str, Dict[str, Any]] = {}
-        # Format: {
-        #   chat_id: {
-        #     'messages': [],
-        #     'cumulative_tokens': {
-        #       'total': 0,
-        #       'input': 0,
-        #       'output': 0,
-        #       'by_turn': []  # Track each turn
-        #     },
-        #     'session_id': '',
-        #     'last_activity': datetime
-        #   }
-        # }
+        
+        # Track unsaved messages per chat
+        self.unsaved_messages: Dict[str, List[Dict]] = defaultdict(list)
+        
+        # Auto-save task
+        self._auto_save_task = None
+        
+        logger.info(
+            f"ChatSessionManager initialized - max_tokens={self.max_tokens_per_chat}, "
+            f"auto_save_interval={auto_save_interval_minutes}min"
+        )
     
     def generate_chat_id(self) -> str:
-        """Generate unique chat ID"""
         return f"chat_{uuid.uuid4().hex[:16]}"
     
     def generate_session_id(self) -> str:
-        """Generate unique session ID"""
         return f"session_{uuid.uuid4().hex[:16]}"
     
     async def create_new_chat(
@@ -54,12 +52,11 @@ class ChatSessionManager:
         refresh_token: str,
         topic: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Create a new chat in database FIRST, then cache it"""
+        """Create new chat in database"""
         
         chat_id = self.generate_chat_id()
         session_id = self.generate_session_id()
         
-        # INSERT chat into database
         insert_query = f"""
         INSERT INTO chats (chat_id, user_id, topic, total_tokens, is_active, created_at, updated_at)
         VALUES (
@@ -78,17 +75,12 @@ class ChatSessionManager:
             await run_query(insert_query, access_token, refresh_token)
             logger.info(f"chat_created_db - chat_id={chat_id}")
             
-            # Initialize cache with PROPER token tracking
             self.active_chats[chat_id] = {
                 'messages': [],
-                'cumulative_tokens': {
-                    'total': 0,
-                    'input': 0,
-                    'output': 0,
-                    'by_turn': []
-                },
+                'cumulative_tokens': {'total': 0, 'input': 0, 'output': 0, 'by_turn': []},
                 'session_id': session_id,
                 'last_activity': datetime.utcnow(),
+                'last_save': datetime.utcnow(),
                 'user_id': user_id,
                 'is_new': True
             }
@@ -111,23 +103,22 @@ class ChatSessionManager:
         access_token: str,
         refresh_token: str
     ) -> Dict[str, Any]:
-        """Load existing chat from DB if not in cache"""
+        """Load chat from DB if not in cache"""
         
-        # Check cache first
         if chat_id in self.active_chats:
             logger.info(f"chat_cache_hit - chat_id={chat_id}")
+            chat = self.active_chats[chat_id]
             return {
                 'chat_id': chat_id,
-                'session_id': self.active_chats[chat_id]['session_id'],
+                'session_id': chat['session_id'],
                 'is_new': False,
-                'total_tokens': self.active_chats[chat_id]['cumulative_tokens']['total'],
-                'messages': self.active_chats[chat_id]['messages']
+                'total_tokens': chat['cumulative_tokens']['total'],
+                'messages': chat['messages']
             }
         
-        # Load from database
         logger.info(f"chat_cache_miss_loading - chat_id={chat_id}")
         
-        # Get chat metadata
+        # Load chat metadata
         chat_query = f"""
         SELECT chat_id, topic, total_tokens, created_at
         FROM chats
@@ -138,7 +129,7 @@ class ChatSessionManager:
         chat_result = await run_query(chat_query, access_token, refresh_token)
         
         if not chat_result:
-            raise ValueError(f"Chat {chat_id} not found or access denied")
+            raise ValueError(f"Chat {chat_id} not found")
         
         # Load messages
         messages_query = f"""
@@ -150,36 +141,21 @@ class ChatSessionManager:
         
         messages_result = await run_query(messages_query, access_token, refresh_token)
         
-        # Calculate cumulative tokens from loaded messages
-        cumulative_input = 0
-        cumulative_output = 0
-        turn_history = []
-        
-        for msg in messages_result:
-            msg_tokens = msg.get('tokens', 0)
-            if msg['role'] == 'user':
-                cumulative_input += msg_tokens
-            elif msg['role'] == 'assistant':
-                cumulative_output += msg_tokens
-            
-            turn_history.append({
-                'role': msg['role'],
-                'tokens': msg_tokens,
-                'timestamp': msg['created_at']
-            })
-        
+        # Calculate tokens
+        cumulative_input = sum(msg['tokens'] for msg in messages_result if msg['role'] == 'user')
+        cumulative_output = sum(msg['tokens'] for msg in messages_result if msg['role'] == 'assistant')
         cumulative_total = cumulative_input + cumulative_output
         
-        # Cache the loaded chat
+        turn_history = [
+            {'role': msg['role'], 'tokens': msg['tokens'], 'timestamp': msg['created_at']}
+            for msg in messages_result
+        ]
+        
+        # Cache it
         session_id = self.generate_session_id()
         self.active_chats[chat_id] = {
             'messages': [
-                {
-                    'role': msg['role'],
-                    'content': msg['content'],
-                    'tokens': msg['tokens'],
-                    'session_id': msg['session_id']
-                }
+                {'role': msg['role'], 'content': msg['content'], 'tokens': msg['tokens'], 'session_id': msg['session_id']}
                 for msg in messages_result
             ],
             'cumulative_tokens': {
@@ -190,6 +166,7 @@ class ChatSessionManager:
             },
             'session_id': session_id,
             'last_activity': datetime.utcnow(),
+            'last_save': datetime.utcnow(),
             'user_id': user_id,
             'is_new': False
         }
@@ -207,17 +184,8 @@ class ChatSessionManager:
             'messages': self.active_chats[chat_id]['messages']
         }
     
-    def add_message_to_cache(
-        self,
-        chat_id: str,
-        role: str,
-        content: str,
-        tokens: int
-    ):
-        """
-        Add message to cache with PROPER token accumulation.
-        FIXED: Now correctly accumulates tokens across the session.
-        """
+    def add_message_to_cache(self, chat_id: str, role: str, content: str, tokens: int):
+        """Add message to cache and track for DB save"""
         
         if chat_id not in self.active_chats:
             logger.warning(f"chat_not_in_cache - chat_id={chat_id}")
@@ -225,23 +193,24 @@ class ChatSessionManager:
         
         chat_data = self.active_chats[chat_id]
         
-        # Add message
-        chat_data['messages'].append({
+        message = {
             'role': role,
             'content': content,
             'tokens': tokens,
-            'session_id': chat_data['session_id']
-        })
+            'session_id': chat_data['session_id'],
+            'created_at': datetime.utcnow()
+        }
         
-        # FIXED: Properly accumulate tokens
+        chat_data['messages'].append(message)
+        self.unsaved_messages[chat_id].append(message)
+        
+        # Update tokens
         chat_data['cumulative_tokens']['total'] += tokens
-        
         if role == 'user':
             chat_data['cumulative_tokens']['input'] += tokens
         elif role == 'assistant':
             chat_data['cumulative_tokens']['output'] += tokens
         
-        # Track by turn
         chat_data['cumulative_tokens']['by_turn'].append({
             'role': role,
             'tokens': tokens,
@@ -252,15 +221,13 @@ class ChatSessionManager:
         chat_data['last_activity'] = datetime.utcnow()
         
         logger.info(
-            f"message_cached - chat_id={chat_id}, role={role}, "
-            f"msg_tokens={tokens}, cumulative_total={chat_data['cumulative_tokens']['total']}, "
-            f"cumulative_input={chat_data['cumulative_tokens']['input']}, "
-            f"cumulative_output={chat_data['cumulative_tokens']['output']}"
+            f"message_cached - chat_id={chat_id}, role={role}, tokens={tokens}, "
+            f"cumulative_total={chat_data['cumulative_tokens']['total']}, "
+            f"unsaved_count={len(self.unsaved_messages[chat_id])}"
         )
     
     async def check_token_limit(self, chat_id: str) -> bool:
-        """Check if chat has exceeded token limit (from cumulative count)"""
-        
+        """Check token limit"""
         if chat_id not in self.active_chats:
             return True
         
@@ -276,56 +243,43 @@ class ChatSessionManager:
         return True
     
     def get_token_stats(self, chat_id: str) -> Dict[str, Any]:
-        """Get detailed token statistics for a chat"""
+        """Get token statistics"""
         if chat_id not in self.active_chats:
             return {}
-        
         return self.active_chats[chat_id]['cumulative_tokens']
     
     async def save_chat_to_db(
         self,
         chat_id: str,
         access_token: str,
-        refresh_token: str
+        refresh_token: str,
+        force: bool = False
     ) -> int:
-        """Batch save all cached messages to database"""
+        """Async batch save unsaved messages to database"""
         
         if chat_id not in self.active_chats:
-            logger.warning(f"chat_not_cached - chat_id={chat_id}")
             return 0
         
-        cached = self.active_chats[chat_id]
-        messages = cached['messages']
+        unsaved = self.unsaved_messages.get(chat_id, [])
         
-        if not messages:
-            logger.info(f"no_messages_to_save - chat_id={chat_id}")
+        if not unsaved:
+            return 0
+        
+        # Check if auto-save is needed
+        chat_data = self.active_chats[chat_id]
+        time_since_save = datetime.utcnow() - chat_data['last_save']
+        
+        if not force and time_since_save < self.auto_save_interval:
+            logger.debug(f"skipping_auto_save - chat_id={chat_id}, time_since_save={time_since_save}")
             return 0
         
         try:
-            # Determine new messages
-            if cached.get('is_new', False):
-                new_messages = messages
-            else:
-                # Get existing count from DB
-                count_query = f"""
-                SELECT COUNT(*) as count
-                FROM messages
-                WHERE chat_id = '{pg_escape(chat_id)}';
-                """
-                count_result = await run_query(count_query, access_token, refresh_token)
-                existing_count = count_result[0]['count'] if count_result else 0
-                new_messages = messages[existing_count:]
-            
-            if not new_messages:
-                logger.info(f"all_messages_saved - chat_id={chat_id}")
-                return 0
-            
-            # Batch insert
+            # Batch insert messages
             values = []
-            for msg in new_messages:
+            for msg in unsaved:
                 values.append(
                     f"('{chat_id}', '{msg['session_id']}', '{pg_escape(msg['role'])}', "
-                    f"'{pg_escape(msg['content'])}', {msg['tokens']}, NOW())"
+                    f"'{pg_escape(msg['content'])}', {msg['tokens']}, '{msg['created_at'].isoformat()}')"
                 )
             
             insert_query = f"""
@@ -335,72 +289,46 @@ class ChatSessionManager:
             
             await run_query(insert_query, access_token, refresh_token)
             
-            # Update chat with CUMULATIVE total
-            cumulative_total = cached['cumulative_tokens']['total']
+            # Update chat total_tokens
+            cumulative_total = chat_data['cumulative_tokens']['total']
             
             update_query = f"""
             UPDATE chats
-            SET total_tokens = {cumulative_total},
-                updated_at = NOW()
+            SET total_tokens = {cumulative_total}, updated_at = NOW()
             WHERE chat_id = '{chat_id}';
             """
             
             await run_query(update_query, access_token, refresh_token)
             
+            # Clear unsaved messages
+            saved_count = len(unsaved)
+            self.unsaved_messages[chat_id] = []
+            chat_data['last_save'] = datetime.utcnow()
+            
             logger.info(
-                f"chat_saved - chat_id={chat_id}, new_messages={len(new_messages)}, "
+                f"chat_saved - chat_id={chat_id}, messages_saved={saved_count}, "
                 f"cumulative_tokens={cumulative_total}"
             )
             
-            cached['is_new'] = False
-            return len(new_messages)
+            return saved_count
             
         except Exception as e:
             logger.error(f"chat_save_error - chat_id={chat_id}, error={e}", exc_info=True)
             raise
     
-    async def switch_chat(
-        self,
-        old_chat_id: Optional[str],
-        new_chat_id: str,
-        user_id: str,
-        access_token: str,
-        refresh_token: str
-    ):
-        """Save old chat and load new chat"""
-        
-        if old_chat_id and old_chat_id in self.active_chats:
-            logger.info(f"saving_old_chat - chat_id={old_chat_id}")
-            await self.save_chat_to_db(old_chat_id, access_token, refresh_token)
-        
-        logger.info(f"loading_new_chat - chat_id={new_chat_id}")
-        return await self.get_or_load_chat(new_chat_id, user_id, access_token, refresh_token)
+    async def auto_save_all(self, access_token: str, refresh_token: str):
+        """Auto-save all chats that need saving"""
+        for chat_id in list(self.active_chats.keys()):
+            try:
+                await self.save_chat_to_db(chat_id, access_token, refresh_token, force=False)
+            except Exception as e:
+                logger.error(f"auto_save_error - chat_id={chat_id}, error={e}")
     
-    async def end_session(
-        self,
-        chat_id: str,
-        access_token: str,
-        refresh_token: str
-    ):
-        """End session and save everything"""
-        
+    async def end_session(self, chat_id: str, access_token: str, refresh_token: str):
+        """End session and force save"""
         if chat_id in self.active_chats:
-            await self.save_chat_to_db(chat_id, access_token, refresh_token)
+            await self.save_chat_to_db(chat_id, access_token, refresh_token, force=True)
             logger.info(f"session_ended - chat_id={chat_id}")
-    
-    async def cleanup_inactive_chats(self):
-        """Remove inactive chats from cache"""
-        
-        now = datetime.utcnow()
-        inactive = []
-        
-        for chat_id, data in self.active_chats.items():
-            if now - data['last_activity'] > self.session_timeout:
-                inactive.append(chat_id)
-        
-        for chat_id in inactive:
-            del self.active_chats[chat_id]
-            logger.info(f"chat_cleaned - chat_id={chat_id}")
     
     async def load_chat_history(
         self,
@@ -436,12 +364,35 @@ class ChatSessionManager:
             logger.error(f"chat_history_error - error={e}", exc_info=True)
             return []
     
+    async def load_chat_messages(
+        self,
+        chat_id: str,
+        user_id: str,
+        access_token: str,
+        refresh_token: str,
+        limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Load messages for a chat"""
+        
+        query = f"""
+        SELECT role, content, tokens, created_at
+        FROM messages
+        WHERE chat_id = '{pg_escape(chat_id)}'
+        ORDER BY created_at ASC
+        LIMIT {limit};
+        """
+        
+        try:
+            messages = await run_query(query, access_token, refresh_token)
+            return messages
+        except Exception as e:
+            logger.error(f"load_messages_error - error={e}", exc_info=True)
+            return []
+    
     def get_cached_messages(self, chat_id: str) -> List[Dict[str, Any]]:
         """Get messages from cache"""
-        
         if chat_id not in self.active_chats:
             return []
-        
         return self.active_chats[chat_id]['messages']
 
 
@@ -449,5 +400,6 @@ class ChatSessionManager:
 chat_manager = ChatSessionManager(
     max_context_multiplier=getattr(settings, 'MAX_CONTEXT_MULTIPLIER', 100),
     llm_context_limit=getattr(settings, 'LLM_MAX_TOKENS', 8000),
-    session_timeout_minutes=getattr(settings, 'SESSION_TIMEOUT_MINUTES', 55)
+    session_timeout_minutes=getattr(settings, 'SESSION_TIMEOUT_MINUTES', 55),
+    auto_save_interval_minutes=getattr(settings, 'AUTO_SAVE_INTERVAL_MINUTES', 5)
 )

@@ -1,4 +1,4 @@
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agent.state import AgentState
 from langchain_core.runnables import RunnableConfig
 from agent.llm import get_llm
@@ -25,12 +25,11 @@ async def process_input(state: AgentState, config: RunnableConfig) -> AgentState
     
     chat_id = state.get("chat_id")
     
-    # Check token limit using cumulative count
+    # Check token limit
     if chat_id:
         within_limit = await chat_manager.check_token_limit(chat_id)
         
         if not within_limit:
-            # Get token stats for logging
             stats = chat_manager.get_token_stats(chat_id)
             logger.warning(
                 f"token_limit_reached - chat_id={chat_id}, "
@@ -38,7 +37,7 @@ async def process_input(state: AgentState, config: RunnableConfig) -> AgentState
             )
             
             state["messages"].append(
-                AIMessage(content="This chat has reached its maximum length. Please start a new chat to continue.")
+                AIMessage(content="This chat has reached its maximum length. Please start a new chat.")
             )
             track_error("token_limit_exceeded", "chat")
             return state
@@ -48,10 +47,7 @@ async def process_input(state: AgentState, config: RunnableConfig) -> AgentState
 
 
 async def generate_response(state: AgentState, config: RunnableConfig) -> AgentState:
-    """
-    Generate AI response using LLM with tool support.
-    FIXED: Properly tracks and accumulates tokens.
-    """
+    """Generate AI response using LLM with tool support"""
     
     start_time = time.time()
     llm = get_llm()
@@ -64,18 +60,16 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
     # Build message list with system prompt
     system_msg = SystemMessage(content=SYSTEM_PROMPT_HELPDESK)
     
-    # Apply windowing to prevent context overflow
-    # Keep system + recent messages (windowing handled by checkpointer too)
+    # Apply windowing (keep recent messages)
     recent_messages = messages[-6:] if len(messages) > 6 else messages
     full_messages = [system_msg] + list(recent_messages)
     
     logger.info(
-        f"llm_invoke_start - chat_id={chat_id}, "
-        f"input_messages={len(full_messages)}"
+        f"llm_invoke_start - chat_id={chat_id}, input_messages={len(full_messages)}"
     )
     
     try:
-        # Get user message content for caching
+        # Extract user message for caching
         user_msg_content = ""
         for msg in reversed(messages):
             if isinstance(msg, HumanMessage):
@@ -85,10 +79,9 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         # Invoke LLM with tools
         response = await llm_with_tools.ainvoke(full_messages, config=config)
         
-        # FIXED: Extract token usage properly
+        # Extract token usage
         metadata = response.response_metadata.get("token_usage", {})
         
-        # Handle different response formats from different LLM providers
         input_tokens = (
             metadata.get("prompt_tokens") or 
             metadata.get("input_tokens") or 
@@ -100,9 +93,8 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
             0
         )
         
-        # If no token info, estimate (fallback)
+        # Fallback estimation if no token info
         if input_tokens == 0 and output_tokens == 0:
-            # Rough estimate: 4 chars per token
             input_tokens = sum(len(str(m.content)) for m in full_messages) // 4
             output_tokens = len(str(response.content)) // 4
             logger.warning(
@@ -110,16 +102,15 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 f"estimated_input={input_tokens}, estimated_output={output_tokens}"
             )
         
-        # Calculate latency
         latency_ms = (time.time() - start_time) * 1000
         
         # Add AI response to state
         state["messages"].append(response)
         
-        # Track metrics - FIXED: Use correct settings variable
+        # Track metrics
         from config import settings
         track_llm_call(
-            model=settings.LLM_MODEL,  # FIXED: Was LLM_MODEl
+            model=settings.LLM_MODEL,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             duration=latency_ms / 1000,
@@ -127,7 +118,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         )
         
         log_llm_call(
-            model=settings.LLM_MODEL,  # FIXED: Was LLM_MODEl
+            model=settings.LLM_MODEL,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             latency_ms=latency_ms
@@ -135,9 +126,9 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
         
         chat_messages_total.labels(role="assistant").inc()
         
-        # FIXED: Properly cache with separate token counts
+        # Cache messages with proper token counts
         if user_msg_content:
-            # Cache user message with its input tokens
+            # Cache user message with input tokens
             chat_manager.add_message_to_cache(
                 chat_id=chat_id,
                 role="user",
@@ -145,7 +136,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 tokens=input_tokens
             )
             
-            # Cache assistant message with its output tokens
+            # Cache assistant message with output tokens
             ai_content = response.content if hasattr(response, 'content') else str(response)
             chat_manager.add_message_to_cache(
                 chat_id=chat_id,
@@ -154,10 +145,8 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 tokens=output_tokens
             )
             
-            # Get updated stats
-            stats_after = chat_manager.get_token_stats(chat_id)
-            
             # Update state with cumulative total
+            stats_after = chat_manager.get_token_stats(chat_id)
             state["total_tokens"] = stats_after.get('total', 0)
             
             # Track in Prometheus
@@ -195,14 +184,9 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
 
 
 async def save_messages(state: AgentState, config: RunnableConfig) -> AgentState:
-    """
-    Final save point - messages already cached during generation.
-    Just logs completion.
-    """
+    """Final save point - messages cached during generation"""
     
     chat_id = state.get("chat_id")
-    
-    # Get final token stats
     stats = chat_manager.get_token_stats(chat_id)
     
     logger.info(
@@ -214,19 +198,6 @@ async def save_messages(state: AgentState, config: RunnableConfig) -> AgentState
     )
     
     return state
-
-
-def should_continue(state: AgentState) -> str:
-    """Determine if conversation should continue"""
-    
-    messages = state["messages"]
-    
-    # Check if last message indicates limit reached
-    if messages and isinstance(messages[-1], AIMessage):
-        if "reached its maximum length" in messages[-1].content:
-            return "end"
-    
-    return "continue"
 
 
 def route_after_llm(state: AgentState) -> str:
