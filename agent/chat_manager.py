@@ -31,8 +31,8 @@ class ChatSessionManager:
         # Track unsaved messages per chat
         self.unsaved_messages: Dict[str, List[Dict]] = defaultdict(list)
         
-        # Track unsaved metrics per chat
-        self.unsaved_metrics: Dict[str, Dict[str, Any]] = {}
+        # Track if metrics have been saved for a session
+        self.metrics_saved: Dict[str, bool] = {}
         
         logger.info(
             f"ChatSessionManager initialized - max_tokens={self.max_tokens_per_chat}, "
@@ -91,6 +91,9 @@ class ChatSessionManager:
                 'total_latency_ms': 0,
                 'latency_records': []
             }
+            
+            # Mark metrics as not saved
+            self.metrics_saved[chat_id] = False
             
             return {
                 'chat_id': chat_id,
@@ -184,6 +187,9 @@ class ChatSessionManager:
             'total_latency_ms': 0,
             'latency_records': []
         }
+        
+        # Mark metrics as not saved for this new session
+        self.metrics_saved[chat_id] = False
         
         logger.info(
             f"chat_loaded - chat_id={chat_id}, messages={len(messages_result)}, "
@@ -365,9 +371,14 @@ class ChatSessionManager:
         access_token: str,
         refresh_token: str
     ):
-        """Save session metrics to database"""
+        """Save session metrics to database (only once per session)"""
         if chat_id not in self.active_chats:
             logger.warning(f"save_metrics_chat_not_found - chat_id={chat_id}")
+            return
+        
+        # FIX: Check if metrics already saved for this session
+        if self.metrics_saved.get(chat_id, False):
+            logger.info(f"metrics_already_saved - chat_id={chat_id}")
             return
         
         chat_data = self.active_chats[chat_id]
@@ -389,8 +400,15 @@ class ChatSessionManager:
         avg_latency = total_latency / len(latency_records) if latency_records else 0
         min_latency = min(latency_records) if latency_records else 0
         max_latency = max(latency_records) if latency_records else 0
+
+        # Calculate cost
+        estimated_cost_usd = self._calculate_cost(
+            tokens['input'], 
+            tokens['output']
+        )
+        cost_per_message = estimated_cost_usd / message_count if message_count > 0 else 0
         
-        # Insert into chat_metrics table
+        # FIX: Use INSERT ... ON CONFLICT to prevent duplicate key errors
         metrics_query = f"""
         INSERT INTO chat_metrics (
             chat_id,
@@ -405,6 +423,8 @@ class ChatSessionManager:
             message_count,
             tool_execution_count,
             error_count,
+            estimated_cost_usd,
+            cost_per_message,
             session_start,
             session_end,
             created_at,
@@ -422,15 +442,34 @@ class ChatSessionManager:
             {message_count},
             {tool_count},
             {error_count},
+            {estimated_cost_usd},
+            {cost_per_message},
             '{session_start.isoformat()}',
             '{session_end.isoformat()}',
             NOW(),
             NOW()
-        );
+        )
+        ON CONFLICT (chat_id, session_id) DO UPDATE SET
+            total_input_tokens = EXCLUDED.total_input_tokens,
+            total_output_tokens = EXCLUDED.total_output_tokens,
+            total_tokens = EXCLUDED.total_tokens,
+            total_latency_ms = EXCLUDED.total_latency_ms,
+            avg_latency_ms = EXCLUDED.avg_latency_ms,
+            min_latency_ms = EXCLUDED.min_latency_ms,
+            max_latency_ms = EXCLUDED.max_latency_ms,
+            message_count = EXCLUDED.message_count,
+            tool_execution_count = EXCLUDED.tool_execution_count,
+            error_count = EXCLUDED.error_count,
+            session_end = EXCLUDED.session_end,
+            updated_at = NOW();
         """
         
         try:
             await run_query(metrics_query, access_token, refresh_token)
+            
+            # Mark as saved
+            self.metrics_saved[chat_id] = True
+            
             logger.info(
                 f"session_metrics_saved - chat_id={chat_id}, "
                 f"duration={session_duration_seconds:.1f}s, messages={message_count}, "
@@ -439,6 +478,13 @@ class ChatSessionManager:
         except Exception as e:
             logger.error(f"session_metrics_save_error - chat_id={chat_id}, error={e}", exc_info=True)
     
+    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Calculate cost based on OPENAI pricing"""
+        INPUT_RATE = 2 / 1000000
+        OUTPUT_RATE = 10 / 1000000
+        
+        return (input_tokens * INPUT_RATE) + (output_tokens * OUTPUT_RATE)
+
     async def end_session(self, chat_id: str, access_token: str, refresh_token: str):
         """End session, force save, and record metrics"""
         if chat_id not in self.active_chats:

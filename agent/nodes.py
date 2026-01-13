@@ -133,20 +133,7 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 tokens=input_tokens
             )
             
-            # Cache assistant message with output tokens
-            chat_manager.add_message_to_cache(
-                chat_id=chat_id,
-                role="assistant",
-                content=ai_content,
-                tokens=output_tokens
-            )
-            
-            # Update state with cumulative total
-            stats_after = chat_manager.get_token_stats(chat_id)
-            state["total_tokens"] = stats_after.get('total', 0)
-            
-            # Track in Prometheus
-            chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
+
         elif ai_content != "":
             # Cache assistant message with output tokens
             chat_manager.add_message_to_cache(
@@ -155,13 +142,13 @@ async def generate_response(state: AgentState, config: RunnableConfig) -> AgentS
                 content=ai_content,
                 tokens=output_tokens
             )
-            
-            # Update state with cumulative total
-            stats_after = chat_manager.get_token_stats(chat_id)
-            state["total_tokens"] = stats_after.get('total', 0)
-            
-            # Track in Prometheus
-            chat_tokens_total.labels(chat_id=chat_id).inc(output_tokens)
+        
+        # Update state with cumulative total
+        stats_after = chat_manager.get_token_stats(chat_id)
+        state["total_tokens"] = stats_after.get('total', 0)
+        
+        # Track in Prometheus
+        chat_tokens_total.labels(chat_id=chat_id).inc(input_tokens + output_tokens)
 
         logger.info(
             f"llm_response_generated - chat_id={chat_id}, "

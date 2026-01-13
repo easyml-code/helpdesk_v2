@@ -104,7 +104,10 @@ async def query_database_with_offload(
         
         metadata = context_offloader.get_metadata(session_id)
         summary = context_offloader.get_summary(session_id)
-        print("\n\n\n\n\n", summary, "\n\n\n\n\n")
+        
+        # FIX: Remove debug print, use proper logging
+        logger.info(f"context_offload_summary - session_id={session_id}, summary={json.dumps(summary)}")
+        
         logger.info(
             f"tool_exec_complete - tool=query_database, query_hash={query_hash}, "
             f"rows={len(results)}, chunks={metadata['total_chunks']}, "

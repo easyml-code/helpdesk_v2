@@ -59,7 +59,7 @@ class UserMetricsResponse(BaseModel):
     total_output_tokens: int
     avg_latency_ms: float
     total_tool_executions: int
-    last_activity: Optional[str]
+    last_activity: Optional[str]  # Now properly typed as Optional[str]
 
 
 class SystemMetricsResponse(BaseModel):
@@ -383,9 +383,6 @@ async def get_chat_messages(
         clear_context()
 
 
-# ============================================================================
-# METRICS ENDPOINTS
-# ============================================================================
 
 @router.get("/metrics/user", response_model=UserMetricsResponse)
 async def get_user_metrics(
@@ -407,6 +404,11 @@ async def get_user_metrics(
         
         await track_request("/metrics/user", "GET", start_time, 200)
         
+        # FIX: Convert datetime to ISO string
+        last_activity = metrics.get('last_activity')
+        if last_activity and not isinstance(last_activity, str):
+            last_activity = last_activity.isoformat() if hasattr(last_activity, 'isoformat') else str(last_activity)
+        
         return UserMetricsResponse(
             total_chats=metrics.get('total_chats', 0),
             total_messages=metrics.get('total_messages', 0),
@@ -415,7 +417,7 @@ async def get_user_metrics(
             total_output_tokens=metrics.get('total_output_tokens', 0),
             avg_latency_ms=metrics.get('avg_latency_ms', 0),
             total_tool_executions=metrics.get('total_tool_executions', 0),
-            last_activity=metrics.get('last_activity')
+            last_activity=last_activity
         )
         
     except Exception as e:
@@ -482,9 +484,6 @@ async def health_check():
     }
 
 
-# ============================================================================
-# HELPER FUNCTION
-# ============================================================================
 
 async def track_request(endpoint: str, method: str, start_time: float, status: int):
     """Track HTTP request metrics"""
